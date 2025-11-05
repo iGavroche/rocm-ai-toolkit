@@ -7,11 +7,16 @@ def get_job(
         config_path: Union[str, dict, OrderedDict],
         name=None
 ):
+    print(f"[DEBUG] get_job called with config_path: {config_path}, name: {name}")
     config = get_config(config_path, name)
+    print(f"[DEBUG] Config loaded, job type: {config.get('job', 'NOT FOUND')}")
+    
     if not config['job']:
         raise ValueError('config file is invalid. Missing "job" key')
 
     job = config['job']
+    print(f"[DEBUG] Creating job instance for type: {job}")
+    
     if job == 'extract':
         from jobs import ExtractJob
         return ExtractJob(config)
@@ -26,7 +31,10 @@ def get_job(
         return GenerateJob(config)
     if job == 'extension':
         from jobs import ExtensionJob
-        return ExtensionJob(config)
+        print(f"[DEBUG] Creating ExtensionJob...")
+        job_instance = ExtensionJob(config)
+        print(f"[DEBUG] ExtensionJob created successfully")
+        return job_instance
 
     # elif job == 'train':
     #     from jobs import TrainJob

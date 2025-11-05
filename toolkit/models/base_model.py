@@ -91,7 +91,8 @@ class BlankNetwork:
 
 
 def flush():
-    torch.cuda.empty_cache()
+    from toolkit.backend_utils import clear_gpu_cache
+    clear_gpu_cache()
     gc.collect()
 
 
@@ -1085,7 +1086,26 @@ class BaseModel:
         latent_list = []
         # Move to vae to device if on cpu
         if self.vae.device == torch.device("cpu"):
-            self.vae.to(device)
+            # For ROCm, handle device transfer with error handling
+            try:
+                from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+                is_rocm = is_rocm_available()
+            except ImportError:
+                is_rocm = False
+            
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    self.vae.to(device)
+                except (RuntimeError, Exception) as e:
+                    error_str = str(e)
+                    if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                        # Keep VAE on CPU if device transfer fails
+                        pass
+                    else:
+                        raise
+            else:
+                self.vae.to(device)
         self.vae.eval()
         self.vae.requires_grad_(False)
         # move to device and dtype
@@ -1128,7 +1148,27 @@ class BaseModel:
 
         # Move to vae to device if on cpu
         if self.vae.device == torch.device('cpu'):
-            self.vae.to(self.device)
+            # For ROCm, handle device transfer with error handling
+            try:
+                from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+                is_rocm = is_rocm_available()
+            except ImportError:
+                is_rocm = False
+            
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    self.vae.to(self.device)
+                except (RuntimeError, Exception) as e:
+                    error_str = str(e)
+                    if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                        # Keep VAE on CPU if device transfer fails
+                        # Decode will happen on CPU, then move output to device
+                        pass
+                    else:
+                        raise
+            else:
+                self.vae.to(self.device)
         latents = latents.to(device, dtype=dtype)
         latents = (
             latents / self.vae.config['scaling_factor']) + self.vae.config['shift_factor']
@@ -1428,16 +1468,39 @@ class BaseModel:
         self.device_state = None
 
     def set_device_state(self, state):
+        # Helper function for ROCm-safe device transfer
+        def safe_to_device(module, target_device):
+            try:
+                from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+                is_rocm = is_rocm_available()
+            except ImportError:
+                is_rocm = False
+            
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    module.to(target_device)
+                    synchronize_gpu()
+                except (RuntimeError, Exception) as e:
+                    error_str = str(e)
+                    if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                        # Keep on current device if transfer fails
+                        pass
+                    else:
+                        raise
+            else:
+                module.to(target_device)
+        
         if state['vae']['training']:
             self.vae.train()
         else:
             self.vae.eval()
-        self.vae.to(state['vae']['device'])
+        safe_to_device(self.vae, state['vae']['device'])
         if state['unet']['training']:
             self.unet.train()
         else:
             self.unet.eval()
-        self.unet.to(state['unet']['device'])
+        safe_to_device(self.unet, state['unet']['device'])
         if state['unet']['requires_grad']:
             self.unet.requires_grad_(True)
         else:
@@ -1449,7 +1512,7 @@ class BaseModel:
                         encoder.train()
                     else:
                         encoder.eval()
-                    encoder.to(state['text_encoder'][i]['device'])
+                    safe_to_device(encoder, state['text_encoder'][i]['device'])
                     encoder.requires_grad_(
                         state['text_encoder'][i]['requires_grad'])
                 else:
@@ -1457,7 +1520,7 @@ class BaseModel:
                         encoder.train()
                     else:
                         encoder.eval()
-                    encoder.to(state['text_encoder']['device'])
+                    safe_to_device(encoder, state['text_encoder']['device'])
                     encoder.requires_grad_(
                         state['text_encoder']['requires_grad'])
         else:
@@ -1465,12 +1528,12 @@ class BaseModel:
                 self.text_encoder.train()
             else:
                 self.text_encoder.eval()
-            self.text_encoder.to(state['text_encoder']['device'])
+            safe_to_device(self.text_encoder, state['text_encoder']['device'])
             self.text_encoder.requires_grad_(
                 state['text_encoder']['requires_grad'])
 
         if self.adapter is not None:
-            self.adapter.to(state['adapter']['device'])
+            safe_to_device(self.adapter, state['adapter']['device'])
             self.adapter.requires_grad_(state['adapter']['requires_grad'])
             if state['adapter']['training']:
                 self.adapter.train()
@@ -1478,7 +1541,7 @@ class BaseModel:
                 self.adapter.eval()
 
         if self.refiner_unet is not None:
-            self.refiner_unet.to(state['refiner_unet']['device'])
+            safe_to_device(self.refiner_unet, state['refiner_unet']['device'])
             self.refiner_unet.requires_grad_(
                 state['refiner_unet']['requires_grad'])
             if state['refiner_unet']['training']:

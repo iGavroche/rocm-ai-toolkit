@@ -765,14 +765,51 @@ class ToolkitNetworkMixin:
         self.is_active = False
 
     def force_to(self: Network, device, dtype):
-        self.to(device, dtype)
+        # For ROCm, handle device transfers carefully
+        try:
+            from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+            is_rocm = is_rocm_available()
+        except ImportError:
+            is_rocm = False
+        
+        if is_rocm:
+            synchronize_gpu()
+            try:
+                # Step-by-step device transfer for ROCm
+                self.to("cpu")  # Ensure on CPU first
+                self.to(device)
+                self.to(dtype=dtype)
+            except (RuntimeError, Exception) as e:
+                if "HIP" in str(e) or "hipError" in str(e):
+                    # Keep on CPU if HIP error
+                    self.to("cpu")
+                else:
+                    raise
+        else:
+            self.to(device, dtype)
+        
         loras = []
         if hasattr(self, 'unet_loras'):
             loras += self.unet_loras
         if hasattr(self, 'text_encoder_loras'):
             loras += self.text_encoder_loras
+        
         for lora in loras:
-            lora.to(device, dtype)
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    # Step-by-step device transfer for ROCm
+                    lora.to("cpu")  # Ensure on CPU first
+                    lora.to(device)
+                    lora.to(dtype=dtype)
+                except (RuntimeError, Exception) as e:
+                    if "HIP" in str(e) or "hipError" in str(e):
+                        # Keep on CPU if HIP error
+                        lora.to("cpu")
+                    else:
+                        raise
+            else:
+                lora.to(device, dtype)
 
     def get_all_modules(self: Network) -> List[Module]:
         loras = []

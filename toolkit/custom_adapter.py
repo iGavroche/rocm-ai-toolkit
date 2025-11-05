@@ -43,8 +43,13 @@ from transformers import (
     ConvNextModel,
     ConvNextForImageClassification,
     ConvNextImageProcessor,
-    UMT5EncoderModel, LlamaTokenizerFast, AutoModel, AutoTokenizer, BitsAndBytesConfig
+    UMT5EncoderModel, LlamaTokenizerFast, AutoModel, AutoTokenizer
 )
+# Import BitsAndBytesConfig conditionally - may not work with ROCm
+try:
+    from transformers import BitsAndBytesConfig
+except (ImportError, RuntimeError):
+    BitsAndBytesConfig = None  # Will be handled gracefully where used
 from toolkit.models.size_agnostic_feature_encoder import SAFEImageProcessor, SAFEVisionModel
 
 from transformers import ViTHybridImageProcessor, ViTHybridForImageClassification
@@ -220,18 +225,24 @@ class CustomAdapter(torch.nn.Module):
         elif self.adapter_type == 'llm_adapter':
             kwargs = {}
             if self.config.quantize_llm:
-                bnb_kwargs = {
-                    'load_in_4bit': True,
-                    'bnb_4bit_quant_type': "nf4",
-                    'bnb_4bit_compute_dtype': torch.bfloat16
-                }
-                quantization_config = BitsAndBytesConfig(**bnb_kwargs)
-                kwargs['quantization_config'] = quantization_config
-                kwargs['torch_dtype'] = torch_dtype
-                self.te = AutoModel.from_pretrained(
-                    self.config.text_encoder_path,
-                    **kwargs
-                )
+                # Check if BitsAndBytesConfig is available (may not work with ROCm)
+                from toolkit.backend_utils import is_rocm_available
+                if BitsAndBytesConfig is None or is_rocm_available():
+                    print("WARNING: BitsAndBytesConfig not available or ROCm detected. LLM quantization disabled.")
+                    self.config.quantize_llm = False
+                else:
+                    bnb_kwargs = {
+                        'load_in_4bit': True,
+                        'bnb_4bit_quant_type': "nf4",
+                        'bnb_4bit_compute_dtype': torch.bfloat16
+                    }
+                    quantization_config = BitsAndBytesConfig(**bnb_kwargs)
+                    kwargs['quantization_config'] = quantization_config
+                    kwargs['torch_dtype'] = torch_dtype
+                    self.te = AutoModel.from_pretrained(
+                        self.config.text_encoder_path,
+                        **kwargs
+                    )
             else:
                 self.te = AutoModel.from_pretrained(self.config.text_encoder_path).to(
                     self.sd_ref().unet.device, 

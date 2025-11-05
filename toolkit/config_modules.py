@@ -20,6 +20,17 @@ else:
 
 class SaveConfig:
     def __init__(self, **kwargs):
+        # Check for quick test mode
+        quick_test = os.environ.get("QUICK_TEST_MODE", "0") == "1"
+        
+        # Apply quick test mode modifications
+        if quick_test:
+            # Reduce save frequency for faster iteration
+            if 'save_every' in kwargs and kwargs['save_every'] > 10:
+                kwargs['save_every'] = 10
+            elif 'save_every' not in kwargs:
+                kwargs['save_every'] = 10
+        
         self.save_every: int = kwargs.get('save_every', 1000)
         self.dtype: str = kwargs.get('dtype', 'float16')
         self.max_step_saves_to_keep: int = kwargs.get('max_step_saves_to_keep', 5)
@@ -75,6 +86,17 @@ class SampleItem:
 
 class SampleConfig:
     def __init__(self, **kwargs):
+        # Check for quick test mode
+        quick_test = os.environ.get("QUICK_TEST_MODE", "0") == "1"
+        
+        # Apply quick test mode modifications
+        if quick_test:
+            # Reduce sample frequency for faster iteration
+            if 'sample_every' in kwargs and kwargs['sample_every'] > 10:
+                kwargs['sample_every'] = 10
+            elif 'sample_every' not in kwargs:
+                kwargs['sample_every'] = 10
+        
         self.sampler: str = kwargs.get('sampler', 'ddpm')
         self.sample_every: int = kwargs.get('sample_every', 100)
         self.width: int = kwargs.get('width', 512)
@@ -343,6 +365,23 @@ LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
 
 class TrainConfig:
     def __init__(self, **kwargs):
+        # Check for quick test mode
+        quick_test = os.environ.get("QUICK_TEST_MODE", "0") == "1"
+        
+        # Apply quick test mode modifications
+        if quick_test:
+            # Reduce steps if not explicitly set to a small value
+            if 'steps' in kwargs and kwargs['steps'] > 50:
+                kwargs['steps'] = 50
+            elif 'steps' not in kwargs:
+                kwargs['steps'] = 50
+            
+            # Reduce batch size if > 1
+            if 'batch_size' in kwargs and kwargs['batch_size'] > 1:
+                kwargs['batch_size'] = 1
+            elif 'batch_size' not in kwargs:
+                kwargs['batch_size'] = 1
+        
         self.noise_scheduler = kwargs.get('noise_scheduler', 'ddpm')
         self.content_or_style: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')
         self.content_or_style_reg: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')

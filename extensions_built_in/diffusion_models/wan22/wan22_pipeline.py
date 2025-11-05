@@ -147,10 +147,43 @@ class Wan22Pipeline(WanPipeline):
             flush()
 
         transformer_dtype = self.transformer.dtype
-        prompt_embeds = prompt_embeds.to(device, transformer_dtype)
+        # For ROCm, handle prompt_embeds device transfer with error handling
+        try:
+            from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+            is_rocm = is_rocm_available()
+        except ImportError:
+            is_rocm = False
+        
+        if is_rocm:
+            synchronize_gpu()
+            try:
+                prompt_embeds = prompt_embeds.to(device, transformer_dtype)
+                synchronize_gpu()
+            except (RuntimeError, Exception) as e:
+                error_str = str(e)
+                if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                    # Keep on CPU if transfer fails - PyTorch will handle cross-device operations
+                    pass
+                else:
+                    raise
+        else:
+            prompt_embeds = prompt_embeds.to(device, transformer_dtype)
+        
         if negative_prompt_embeds is not None:
-            negative_prompt_embeds = negative_prompt_embeds.to(
-                device, transformer_dtype)
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    negative_prompt_embeds = negative_prompt_embeds.to(device, transformer_dtype)
+                    synchronize_gpu()
+                except (RuntimeError, Exception) as e:
+                    error_str = str(e)
+                    if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                        # Keep on CPU if transfer fails
+                        pass
+                    else:
+                        raise
+            else:
+                negative_prompt_embeds = negative_prompt_embeds.to(device, transformer_dtype)
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)

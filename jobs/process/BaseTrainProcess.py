@@ -34,8 +34,9 @@ class BaseTrainProcess(BaseProcess):
         # if training seed is set, use it
         if self.training_seed is not None:
             torch.manual_seed(self.training_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(self.training_seed)
+            from toolkit.backend_utils import manual_seed, is_gpu_available
+            if is_gpu_available():
+                manual_seed(self.training_seed)
             random.seed(self.training_seed)
 
         self.progress_bar = None

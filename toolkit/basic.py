@@ -9,7 +9,8 @@ def value_map(inputs, min_in, max_in, min_out, max_out):
 
 
 def flush(garbage_collect=True):
-    torch.cuda.empty_cache()
+    from toolkit.backend_utils import clear_gpu_cache
+    clear_gpu_cache()
     if garbage_collect:
         gc.collect()
 

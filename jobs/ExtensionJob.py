@@ -13,10 +13,20 @@ class ExtensionJob(BaseJob):
         self.load_processes(self.process_dict)
 
     def run(self):
+        print("[DEBUG] ExtensionJob.run() - calling super().run()")
+        import sys
+        sys.stdout.flush()
         super().run()
 
+        print("[DEBUG] ExtensionJob.run() - super() completed")
+        sys.stdout.flush()
         print("")
         print(f"Running  {len(self.process)} process{'' if len(self.process) == 1 else 'es'}")
+        sys.stdout.flush()
 
-        for process in self.process:
+        for i, process in enumerate(self.process):
+            print(f"[DEBUG] ExtensionJob.run() - starting process {i}: {type(process).__name__}")
+            sys.stdout.flush()
             process.run()
+            print(f"[DEBUG] ExtensionJob.run() - process {i} completed")
+            sys.stdout.flush()

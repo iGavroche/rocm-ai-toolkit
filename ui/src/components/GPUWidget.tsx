@@ -39,13 +39,15 @@ export default function GPUWidget({ gpu }: GPUWidgetProps) {
                 <p className={`text-sm font-medium ${getTemperatureColor(gpu.temperature)}`}>{gpu.temperature}°C</p>
               </div>
             </div>
-            <div className="flex items-center space-x-2">
-              <Fan className="w-4 h-4 text-blue-400" />
-              <div>
-                <p className="text-xs text-gray-400">Fan Speed</p>
-                <p className="text-sm font-medium text-blue-400">{gpu.fan.speed}%</p>
+            {gpu.fan && (
+              <div className="flex items-center space-x-2">
+                <Fan className="w-4 h-4 text-blue-400" />
+                <div>
+                  <p className="text-xs text-gray-400">Fan Speed</p>
+                  <p className="text-sm font-medium text-blue-400">{gpu.fan.speed}%</p>
+                </div>
               </div>
-            </div>
+            )}
           </div>
           <div>
             <div className="flex items-center space-x-2 mb-1">
@@ -79,25 +81,31 @@ export default function GPUWidget({ gpu }: GPUWidgetProps) {
         </div>
 
         {/* Power and Clocks Section */}
-        <div className="grid grid-cols-2 gap-4 pt-2 border-t border-gray-800">
-          <div className="flex items-start space-x-2">
-            <Clock className="w-4 h-4 text-purple-400" />
-            <div>
-              <p className="text-xs text-gray-400">Clock Speed</p>
-              <p className="text-sm text-gray-200">{gpu.clocks.graphics} MHz</p>
-            </div>
+        {(gpu.clocks || gpu.power) && (
+          <div className="grid grid-cols-2 gap-4 pt-2 border-t border-gray-800">
+            {gpu.clocks && (
+              <div className="flex items-start space-x-2">
+                <Clock className="w-4 h-4 text-purple-400" />
+                <div>
+                  <p className="text-xs text-gray-400">Clock Speed</p>
+                  <p className="text-sm text-gray-200">{gpu.clocks.graphics} MHz</p>
+                </div>
+              </div>
+            )}
+            {gpu.power && (
+              <div className="flex items-start space-x-2">
+                <Zap className="w-4 h-4 text-amber-400" />
+                <div>
+                  <p className="text-xs text-gray-400">Power Draw</p>
+                  <p className="text-sm text-gray-200">
+                    {gpu.power.draw?.toFixed(1)}W
+                    <span className="text-gray-400 text-xs"> / {gpu.power.limit?.toFixed(1) || ' ? '}W</span>
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
-          <div className="flex items-start space-x-2">
-            <Zap className="w-4 h-4 text-amber-400" />
-            <div>
-              <p className="text-xs text-gray-400">Power Draw</p>
-              <p className="text-sm text-gray-200">
-                {gpu.power.draw?.toFixed(1)}W
-                <span className="text-gray-400 text-xs"> / {gpu.power.limit?.toFixed(1) || ' ? '}W</span>
-              </p>
-            </div>
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );

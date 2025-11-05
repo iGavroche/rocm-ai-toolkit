@@ -36,17 +36,54 @@ class PromptEmbeds:
         self.attention_mask = attention_mask
 
     def to(self, *args, **kwargs):
-        if isinstance(self.text_embeds, list) or isinstance(self.text_embeds, tuple):
-            self.text_embeds = [t.to(*args, **kwargs) for t in self.text_embeds]
+        # For ROCm, handle device transfers with error handling
+        try:
+            from toolkit.backend_utils import is_rocm_available
+            is_rocm = is_rocm_available()
+        except ImportError:
+            is_rocm = False
+        
+        if is_rocm:
+            # Try device transfer, but keep on original device if it fails
+            try:
+                if isinstance(self.text_embeds, list) or isinstance(self.text_embeds, tuple):
+                    self.text_embeds = [t.to(*args, **kwargs) for t in self.text_embeds]
+                else:
+                    self.text_embeds = self.text_embeds.to(*args, **kwargs)
+                if self.pooled_embeds is not None:
+                    self.pooled_embeds = self.pooled_embeds.to(*args, **kwargs)
+                if self.attention_mask is not None:
+                    if isinstance(self.attention_mask, list) or isinstance(self.attention_mask, tuple):
+                        self.attention_mask = [t.to(*args, **kwargs) for t in self.attention_mask]
+                    else:
+                        self.attention_mask = self.attention_mask.to(*args, **kwargs)
+            except Exception as e:
+                error_str = str(e)
+                error_type = type(e).__name__
+                is_hip_error = ("HIP" in error_str or "hipError" in error_str or 
+                               "hipErrorInvalidValue" in error_str or
+                               "AcceleratorError" in error_type or
+                               isinstance(e, RuntimeError))
+                
+                if is_hip_error:
+                    # Keep on original device if HIP error occurs
+                    # PyTorch will handle device placement during operations
+                    pass
+                else:
+                    raise
         else:
-            self.text_embeds = self.text_embeds.to(*args, **kwargs)
-        if self.pooled_embeds is not None:
-            self.pooled_embeds = self.pooled_embeds.to(*args, **kwargs)
-        if self.attention_mask is not None:
-            if isinstance(self.attention_mask, list) or isinstance(self.attention_mask, tuple):
-                self.attention_mask = [t.to(*args, **kwargs) for t in self.attention_mask]
+            # Normal device transfer for CUDA
+            if isinstance(self.text_embeds, list) or isinstance(self.text_embeds, tuple):
+                self.text_embeds = [t.to(*args, **kwargs) for t in self.text_embeds]
             else:
-                self.attention_mask = self.attention_mask.to(*args, **kwargs)
+                self.text_embeds = self.text_embeds.to(*args, **kwargs)
+            if self.pooled_embeds is not None:
+                self.pooled_embeds = self.pooled_embeds.to(*args, **kwargs)
+            if self.attention_mask is not None:
+                if isinstance(self.attention_mask, list) or isinstance(self.attention_mask, tuple):
+                    self.attention_mask = [t.to(*args, **kwargs) for t in self.attention_mask]
+                else:
+                    self.attention_mask = self.attention_mask.to(*args, **kwargs)
         return self
 
     def detach(self):

@@ -1,5 +1,12 @@
 # this example focuses mainly for training Wan2.2 14b on images. It will work for video as well by increasing
 # the number of frames in the dataset and samples. Training on and generating video is very VRAM intensive.
+# 
+# ROCm Support:
+# This configuration works with both CUDA and ROCm backends. For ROCm (AMD GPUs), ensure you have:
+# - ROCm 7.1+ installed with gfx1151 (Strix Halo) support
+# - PyTorch 2.8+ with ROCm support installed via uv or pip
+# - Set PYTORCH_ROCM_ARCH="gfx1151" environment variable
+# - Device string "cuda:0" works for both CUDA and ROCm (ROCm PyTorch uses CUDA API)
 ---
 job: extension
 config:
@@ -11,7 +18,7 @@ config:
       training_folder: "output"
       # uncomment to see performance stats in the terminal every N steps
 #      performance_log_every: 1000
-      device: cuda:0
+      device: cuda:0  # Works for both CUDA and ROCm backends
       # Use a trigger word if train.unload_text_encoder is true, however, if caching text embeddings, do not use a trigger word
       # trigger_word: "p3r5on"
       network:

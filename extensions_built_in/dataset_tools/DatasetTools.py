@@ -5,7 +5,8 @@ from jobs.process import BaseExtensionProcess
 
 
 def flush():
-    torch.cuda.empty_cache()
+    from toolkit.backend_utils import clear_gpu_cache
+    clear_gpu_cache()
     gc.collect()
 
 

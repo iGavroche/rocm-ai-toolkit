@@ -30,13 +30,13 @@ export interface GpuFan {
 export interface GpuInfo {
   index: number;
   name: string;
-  driverVersion: string;
+  driverVersion?: string; // Optional for ROCm
   temperature: number;
   utilization: GpuUtilization;
   memory: GpuMemory;
-  power: GpuPower;
-  clocks: GpuClocks;
-  fan: GpuFan;
+  power?: GpuPower; // Optional for ROCm
+  clocks?: GpuClocks; // Optional for ROCm
+  fan?: GpuFan; // Optional for ROCm
 }
 
 export interface CpuInfo {
@@ -50,7 +50,7 @@ export interface CpuInfo {
 }
 
 export interface GPUApiResponse {
-  hasNvidiaSmi: boolean;
+  backend: 'nvidia' | 'rocm' | 'none';
   gpus: GpuInfo[];
   error?: string;
 }

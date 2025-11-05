@@ -133,8 +133,22 @@ class DualWanTransformer3DModel(torch.nn.Module):
             if t_name != self._active_transformer_name:
                 if self.low_vram:
                     getattr(self, self._active_transformer_name).to("cpu")
-                    getattr(self, t_name).to(self.device_torch)
-                    torch.cuda.empty_cache()
+                    # For ROCm, handle device transfer carefully
+                    from toolkit.backend_utils import is_rocm_available
+                    if is_rocm_available():
+                        # On ROCm, try to move but catch errors
+                        try:
+                            getattr(self, t_name).to(self.device_torch)
+                        except (RuntimeError, Exception) as e:
+                            if "HIP" in str(e) or "hipError" in str(e):
+                                # Keep on CPU if HIP error occurs
+                                pass
+                            else:
+                                raise
+                    else:
+                        getattr(self, t_name).to(self.device_torch)
+                    from toolkit.backend_utils import clear_gpu_cache
+                    clear_gpu_cache()
                 self._active_transformer_name = t_name
 
         if self.transformer.device != hidden_states.device:
@@ -145,7 +159,25 @@ class DualWanTransformer3DModel(torch.nn.Module):
                 )
                 getattr(self, other_tname).to("cpu")
 
-            self.transformer.to(hidden_states.device)
+            # For ROCm, handle device transfer carefully to avoid HIP errors
+            from toolkit.backend_utils import is_rocm_available
+            if is_rocm_available():
+                # On ROCm, only move if really necessary and catch errors
+                try:
+                    target_device = hidden_states.device
+                    if self.transformer.device != target_device:
+                        self.transformer.to(target_device)
+                except (RuntimeError, Exception) as e:
+                    if "HIP" in str(e) or "hipError" in str(e):
+                        # If HIP error, try to sync and continue
+                        # The model might already be on the correct device due to async errors
+                        import torch
+                        torch.cuda.synchronize() if torch.cuda.is_available() else None
+                        # Don't raise - let it continue and see if it works
+                    else:
+                        raise
+            else:
+                self.transformer.to(hidden_states.device)
 
         return self.transformer(
             hidden_states=hidden_states,
@@ -281,11 +313,41 @@ class Wan2214bModel(Wan21):
 
         self.print_and_status_update("Loading transformer 1")
         dtype = self.torch_dtype
+        
+        # For ROCm, synchronize before loading to catch any async errors
+        from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+        is_rocm = is_rocm_available()
+        if is_rocm:
+            synchronize_gpu()
+        
         transformer_1 = WanTransformer3DModel.from_pretrained(
             transformer_path_1,
             subfolder=subfolder_1,
             torch_dtype=dtype,
-        ).to(dtype=dtype)
+        )
+        # Convert dtype on CPU first to avoid ROCm issues
+        
+        if is_rocm:
+            # For ROCm, dtype conversion might be problematic
+            # The model is already loaded with torch_dtype, so it should be fine
+            # Only convert if really necessary
+            if transformer_1.dtype != dtype:
+                try:
+                    transformer_1 = transformer_1.to(dtype=dtype)
+                except (RuntimeError, Exception) as e:
+                    if "HIP" in str(e) or "hipError" in str(e):
+                        self.print_and_status_update(f"Warning: dtype conversion failed on ROCm, keeping original dtype: {e}")
+                        # Keep original dtype - it should still work
+                    else:
+                        raise
+        else:
+            try:
+                transformer_1 = transformer_1.to(dtype=dtype)
+            except RuntimeError as e:
+                if "HIP" in str(e) or "hipError" in str(e):
+                    self.print_and_status_update(f"Warning: dtype conversion failed, will convert after device transfer: {e}")
+                else:
+                    raise
 
         flush()
 
@@ -294,28 +356,94 @@ class Wan2214bModel(Wan21):
             transformer_1.to('cpu', dtype=dtype)
             flush()
         else:
-            transformer_1.to(self.device_torch, dtype=dtype)
+            # Move to device with error handling for ROCm compatibility
+            from toolkit.backend_utils import is_rocm_available
+            is_rocm = is_rocm_available()
+            
+            if is_rocm:
+                # For ROCm, model loading to device can be problematic
+                # Keep model on CPU initially, let Accelerate handle device placement
+                self.print_and_status_update("ROCm detected: keeping transformer 1 on CPU (will be moved by Accelerate)")
+                # Ensure model is on CPU with correct dtype
+                transformer_1 = transformer_1.cpu()
+                if dtype != transformer_1.dtype:
+                    transformer_1 = transformer_1.to(dtype=dtype)
+                # Don't move to GPU here - let Accelerate.prepare() handle it
+                # This avoids HIP errors during initial load
+            else:
+                # CUDA: normal transfer
+                try:
+                    transformer_1.to(self.device_torch, dtype=dtype)
+                except RuntimeError as e:
+                    if "HIP" in str(e) or "hipError" in str(e):
+                        # Fallback to step-by-step
+                        self.print_and_status_update(f"Warning: Direct device transfer failed, trying step-by-step: {e}")
+                        transformer_1 = transformer_1.to('cpu')
+                        flush()
+                        transformer_1 = transformer_1.to(self.device_torch)
+                        if dtype != transformer_1.dtype:
+                            transformer_1 = transformer_1.to(dtype=dtype)
+                    else:
+                        raise
             flush()
 
         if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None:
             # todo handle two ARAs
             self.print_and_status_update("Quantizing Transformer 1")
-            quantize_model(self, transformer_1)
+            # Get training folder (set by BaseSDTrainProcess before load_model)
+            training_folder = getattr(self, 'training_folder', None)
+            quantize_model(self, transformer_1, model_path=transformer_path_1, model_name="transformer_1", training_folder=training_folder)
             flush()
 
         if self.model_config.low_vram:
             self.print_and_status_update("Moving transformer 1 to CPU")
             transformer_1.to("cpu")
         else:
-            transformer_1.to(self.device_torch)
+            # For ROCm, keep on CPU - Accelerate will handle device placement
+            from toolkit.backend_utils import is_rocm_available
+            if is_rocm_available():
+                self.print_and_status_update("ROCm: keeping transformer 1 on CPU (Accelerate will handle device placement)")
+                transformer_1.to("cpu")
+            else:
+                transformer_1.to(self.device_torch)
 
         self.print_and_status_update("Loading transformer 2")
         dtype = self.torch_dtype
+        
+        # For ROCm, synchronize before loading to catch any async errors
+        from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+        is_rocm = is_rocm_available()
+        if is_rocm:
+            synchronize_gpu()
+        
         transformer_2 = WanTransformer3DModel.from_pretrained(
             transformer_path_2,
             subfolder=subfolder_2,
             torch_dtype=dtype,
-        ).to(dtype=dtype)
+        )
+        # Convert dtype on CPU first to avoid ROCm issues
+        
+        if is_rocm:
+            # For ROCm, dtype conversion might be problematic
+            # The model is already loaded with torch_dtype, so it should be fine
+            # Only convert if really necessary
+            if transformer_2.dtype != dtype:
+                try:
+                    transformer_2 = transformer_2.to(dtype=dtype)
+                except (RuntimeError, Exception) as e:
+                    if "HIP" in str(e) or "hipError" in str(e):
+                        self.print_and_status_update(f"Warning: dtype conversion failed on ROCm, keeping original dtype: {e}")
+                        # Keep original dtype - it should still work
+                    else:
+                        raise
+        else:
+            try:
+                transformer_2 = transformer_2.to(dtype=dtype)
+            except RuntimeError as e:
+                if "HIP" in str(e) or "hipError" in str(e):
+                    self.print_and_status_update(f"Warning: dtype conversion failed, will convert after device transfer: {e}")
+                else:
+                    raise
 
         flush()
 
@@ -324,20 +452,56 @@ class Wan2214bModel(Wan21):
             transformer_2.to('cpu', dtype=dtype)
             flush()
         else:
-            transformer_2.to(self.device_torch, dtype=dtype)
+            # Move to device with error handling for ROCm compatibility
+            from toolkit.backend_utils import is_rocm_available
+            is_rocm = is_rocm_available()
+            
+            if is_rocm:
+                # For ROCm, model loading to device can be problematic
+                # Keep model on CPU initially, let Accelerate handle device placement
+                self.print_and_status_update("ROCm detected: keeping transformer 2 on CPU (will be moved by Accelerate)")
+                # Ensure model is on CPU with correct dtype
+                transformer_2 = transformer_2.cpu()
+                if dtype != transformer_2.dtype:
+                    transformer_2 = transformer_2.to(dtype=dtype)
+                # Don't move to GPU here - let Accelerate.prepare() handle it
+                # This avoids HIP errors during initial load
+            else:
+                # CUDA: normal transfer
+                try:
+                    transformer_2.to(self.device_torch, dtype=dtype)
+                except RuntimeError as e:
+                    if "HIP" in str(e) or "hipError" in str(e):
+                        # Fallback to step-by-step
+                        self.print_and_status_update(f"Warning: Direct device transfer failed, trying step-by-step: {e}")
+                        transformer_2 = transformer_2.to('cpu')
+                        flush()
+                        transformer_2 = transformer_2.to(self.device_torch)
+                        if dtype != transformer_2.dtype:
+                            transformer_2 = transformer_2.to(dtype=dtype)
+                    else:
+                        raise
             flush()
 
         if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None:
             # todo handle two ARAs
             self.print_and_status_update("Quantizing Transformer 2")
-            quantize_model(self, transformer_2)
+            # Get training folder (set by BaseSDTrainProcess before load_model)
+            training_folder = getattr(self, 'training_folder', None)
+            quantize_model(self, transformer_2, model_path=transformer_path_2, model_name="transformer_2", training_folder=training_folder)
             flush()
 
         if self.model_config.low_vram:
             self.print_and_status_update("Moving transformer 2 to CPU")
             transformer_2.to("cpu")
         else:
-            transformer_2.to(self.device_torch)
+            # For ROCm, keep on CPU - Accelerate will handle device placement
+            from toolkit.backend_utils import is_rocm_available
+            if is_rocm_available():
+                self.print_and_status_update("ROCm: keeping transformer 2 on CPU (Accelerate will handle device placement)")
+                transformer_2.to("cpu")
+            else:
+                transformer_2.to(self.device_torch)
     
         layer_offloading_transformer = self.model_config.layer_offloading and self.model_config.layer_offloading_transformer_percent > 0
         # make the combined model

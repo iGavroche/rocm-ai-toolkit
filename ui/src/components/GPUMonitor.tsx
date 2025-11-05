@@ -98,20 +98,21 @@ const GpuMonitor: React.FC = () => {
       );
     }
 
-    if (!gpuData.hasNvidiaSmi) {
+    if (gpuData.backend === 'none') {
       return (
         <div className="bg-yellow-900 border border-yellow-700 text-yellow-300 px-4 py-3 rounded relative" role="alert">
-          <strong className="font-bold">No NVIDIA GPUs detected!</strong>
-          <span className="block sm:inline"> nvidia-smi is not available on this system.</span>
+          <strong className="font-bold">No GPU management tool detected!</strong>
+          <span className="block sm:inline"> Neither rocm-smi nor nvidia-smi is available on this system.</span>
           {gpuData.error && <p className="mt-2 text-sm">{gpuData.error}</p>}
         </div>
       );
     }
 
     if (gpuData.gpus.length === 0) {
+      const backendName = gpuData.backend === 'rocm' ? 'rocm-smi' : 'nvidia-smi';
       return (
         <div className="bg-yellow-900 border border-yellow-700 text-yellow-300 px-4 py-3 rounded relative" role="alert">
-          <span className="block sm:inline">No GPUs found, but nvidia-smi is available.</span>
+          <span className="block sm:inline">No GPUs found, but {backendName} is available.</span>
         </div>
       );
     }

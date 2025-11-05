@@ -56,7 +56,12 @@ from diffusers import \
     AutoencoderKL, \
     UNet2DConditionModel
 from diffusers import PixArtAlphaPipeline, DPMSolverMultistepScheduler, PixArtSigmaPipeline
-from transformers import T5EncoderModel, BitsAndBytesConfig, UMT5EncoderModel, T5TokenizerFast
+from transformers import T5EncoderModel, UMT5EncoderModel, T5TokenizerFast
+# Import BitsAndBytesConfig conditionally - may not work with ROCm
+try:
+    from transformers import BitsAndBytesConfig
+except (ImportError, RuntimeError):
+    BitsAndBytesConfig = None  # Will be handled gracefully where used
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextModelWithProjection
 
 from toolkit.paths import ORIG_CONFIGS_ROOT, DIFFUSERS_CONFIGS_ROOT
@@ -119,7 +124,8 @@ class BlankNetwork:
 
 
 def flush():
-    torch.cuda.empty_cache()
+    from toolkit.backend_utils import clear_gpu_cache
+    clear_gpu_cache()
     gc.collect()
 
 
@@ -141,9 +147,8 @@ class StableDiffusion:
     ):
         self.accelerator = get_accelerator()
         self.custom_pipeline = custom_pipeline
-        self.device = str(device)
-        if "cuda" in self.device and ":" not in self.device:
-            self.device = f"{self.device}:0"
+        from toolkit.backend_utils import normalize_device_string
+        self.device = normalize_device_string(str(device))
         self.device_torch = torch.device(device)
         self.dtype = dtype
         self.torch_dtype = get_torch_dtype(dtype)
@@ -1412,7 +1417,9 @@ class StableDiffusion:
                     if network is not None:
                         network.multiplier = gen_config.network_multiplier
                     torch.manual_seed(gen_config.seed)
-                    torch.cuda.manual_seed(gen_config.seed)
+                    from toolkit.backend_utils import manual_seed, is_gpu_available
+                    if is_gpu_available():
+                        manual_seed(gen_config.seed)
                     
                     generator = torch.manual_seed(gen_config.seed)
 
@@ -1712,7 +1719,8 @@ class StableDiffusion:
         del pipeline
         if refiner_pipeline is not None:
             del refiner_pipeline
-        torch.cuda.empty_cache()
+        from toolkit.backend_utils import clear_gpu_cache
+        clear_gpu_cache()
 
         # restore training state
         torch.set_rng_state(rng_state)

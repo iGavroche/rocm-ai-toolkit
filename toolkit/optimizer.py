@@ -61,18 +61,76 @@ def get_optimizer(
 
         optimizer = Adam8bit(params, lr=learning_rate, eps=1e-6, decouple=True, **optimizer_params)
     elif lower_type.endswith("8bit"):
-        import bitsandbytes
-
-        if lower_type == "adam8bit":
-            return bitsandbytes.optim.Adam8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
-        if lower_type == "ademamix8bit":
-            return bitsandbytes.optim.AdEMAMix8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
-        elif lower_type == "adamw8bit":
-            return bitsandbytes.optim.AdamW8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
-        elif lower_type == "lion8bit":
-            return bitsandbytes.optim.Lion8bit(params, lr=learning_rate, **optimizer_params)
+        # Check if ROCm backend is being used (bitsandbytes doesn't fully support ROCm)
+        from toolkit.backend_utils import is_rocm_available
+        is_rocm = is_rocm_available()
+        
+        if is_rocm:
+            # ROCm backend: use toolkit's own 8-bit implementations or fallback to regular optimizers
+            print(f"WARNING: {optimizer_type} requested but bitsandbytes doesn't fully support ROCm.")
+            print(f"Falling back to alternative 8-bit implementation or regular optimizer.")
+            
+            if lower_type == "adam8bit":
+                from toolkit.optimizers.adam8bit import Adam8bit
+                return Adam8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
+            elif lower_type == "adamw8bit":
+                from toolkit.optimizers.adam8bit import Adam8bit
+                return Adam8bit(params, lr=learning_rate, eps=1e-6, decouple=True, **optimizer_params)
+            elif lower_type == "ademamix8bit":
+                # No direct equivalent, fallback to AdamW8
+                print("WARNING: AdEMAMix8bit not available for ROCm, using AdamW8 instead")
+                from toolkit.optimizers.adam8bit import Adam8bit
+                return Adam8bit(params, lr=learning_rate, eps=1e-6, decouple=True, **optimizer_params)
+            elif lower_type == "lion8bit":
+                # Fallback to regular Lion if available, otherwise AdamW
+                try:
+                    from lion_pytorch import Lion
+                    print("WARNING: Lion8bit not available for ROCm, using regular Lion instead")
+                    return Lion(params, lr=learning_rate, **optimizer_params)
+                except ImportError:
+                    print("WARNING: Lion8bit not available for ROCm, using AdamW8 instead")
+                    from toolkit.optimizers.adam8bit import Adam8bit
+                    return Adam8bit(params, lr=learning_rate, eps=1e-6, decouple=True, **optimizer_params)
+            else:
+                raise ValueError(f'Unknown optimizer type {optimizer_type}')
         else:
-            raise ValueError(f'Unknown optimizer type {optimizer_type}')
+            # CUDA backend: try bitsandbytes
+            try:
+                import bitsandbytes
+                
+                if lower_type == "adam8bit":
+                    return bitsandbytes.optim.Adam8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
+                if lower_type == "ademamix8bit":
+                    return bitsandbytes.optim.AdEMAMix8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
+                elif lower_type == "adamw8bit":
+                    return bitsandbytes.optim.AdamW8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
+                elif lower_type == "lion8bit":
+                    return bitsandbytes.optim.Lion8bit(params, lr=learning_rate, **optimizer_params)
+                else:
+                    raise ValueError(f'Unknown optimizer type {optimizer_type}')
+            except (ImportError, RuntimeError, AttributeError) as e:
+                # bitsandbytes not available or failed to load, fallback to toolkit implementations
+                print(f"WARNING: bitsandbytes not available or failed to load: {e}")
+                print(f"Falling back to alternative 8-bit implementation for {optimizer_type}")
+                
+                if lower_type == "adam8bit":
+                    from toolkit.optimizers.adam8bit import Adam8bit
+                    return Adam8bit(params, lr=learning_rate, eps=1e-6, **optimizer_params)
+                elif lower_type == "adamw8bit":
+                    from toolkit.optimizers.adam8bit import Adam8bit
+                    return Adam8bit(params, lr=learning_rate, eps=1e-6, decouple=True, **optimizer_params)
+                elif lower_type == "ademamix8bit":
+                    from toolkit.optimizers.adam8bit import Adam8bit
+                    return Adam8bit(params, lr=learning_rate, eps=1e-6, decouple=True, **optimizer_params)
+                elif lower_type == "lion8bit":
+                    try:
+                        from lion_pytorch import Lion
+                        return Lion(params, lr=learning_rate, **optimizer_params)
+                    except ImportError:
+                        from toolkit.optimizers.adam8bit import Adam8bit
+                        return Adam8bit(params, lr=learning_rate, eps=1e-6, decouple=True, **optimizer_params)
+                else:
+                    raise ValueError(f'Unknown optimizer type {optimizer_type}')
     elif lower_type == 'adam':
         optimizer = torch.optim.Adam(params, lr=float(learning_rate), eps=1e-6, **optimizer_params)
     elif lower_type == 'adamw':

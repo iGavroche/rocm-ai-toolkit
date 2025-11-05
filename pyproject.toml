@@ -1,0 +1,58 @@
+[project]
+name = "ai-toolkit"
+version = "0.1.0"
+description = "AI Toolkit for LoRA training and model management"
+requires-python = ">=3.10"
+dependencies = [
+    "torchao==0.10.0",
+    "safetensors",
+    "flatten_json",
+    "pyyaml",
+    "oyaml",
+    "tensorboard",
+    "kornia",
+    "invisible-watermark",
+    "einops",
+    "accelerate",
+    "toml",
+    "albumentations==1.4.15",
+    "albucore==0.0.16",
+    "pydantic",
+    "omegaconf",
+    "k-diffusion",
+    "open_clip_torch",
+    "timm",
+    "prodigyopt",
+    "controlnet_aux==0.0.10",
+    "python-dotenv",
+    "bitsandbytes",
+    "hf_transfer",
+    "lpips",
+    "pytorch_fid",
+    "optimum-quanto==0.2.4",
+    "sentencepiece",
+    "huggingface_hub",
+    "peft",
+    "gradio",
+    "python-slugify",
+    "opencv-python",
+    "pytorch-wavelets==1.3.0",
+    "matplotlib==3.10.1",
+    "setuptools==69.5.1",
+]
+
+[project.optional-dependencies]
+rocm = [
+    # PyTorch with ROCm should be installed separately from AMD nightly builds
+    # See README_ROCM.md for installation instructions
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+# Note: PyTorch with ROCm support should be installed separately
+# using: uv pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ --pre torch torchaudio torchvision
+dev-dependencies = []
+

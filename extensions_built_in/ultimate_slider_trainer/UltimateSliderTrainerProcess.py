@@ -205,7 +205,27 @@ class UltimateSliderTrainerProcess(BaseSDTrainProcess):
 
         # move vae to device so we can encode on the fly
         # todo cache latents
-        self.sd.vae.to(self.device_torch)
+        # For ROCm, handle VAE device transfer with error handling
+        try:
+            from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+            is_rocm = is_rocm_available()
+        except ImportError:
+            is_rocm = False
+        
+        if is_rocm:
+            synchronize_gpu()
+            try:
+                self.sd.vae.to(self.device_torch)
+                synchronize_gpu()
+            except (RuntimeError, Exception) as e:
+                error_str = str(e)
+                if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                    # Keep VAE on CPU if device transfer fails
+                    pass
+                else:
+                    raise
+        else:
+            self.sd.vae.to(self.device_torch)
         self.sd.vae.eval()
         self.sd.vae.requires_grad_(False)
 

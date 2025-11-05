@@ -74,7 +74,8 @@ from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
 
 def flush():
-    torch.cuda.empty_cache()
+    from toolkit.backend_utils import clear_gpu_cache
+    clear_gpu_cache()
     gc.collect()
 
 
@@ -712,32 +713,79 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set some config
         self.accelerator.even_batches=False
         
+        # Import safe_prepare for ROCm compatibility
+        from toolkit.accelerator import safe_prepare
+        
+        # For ROCm, ensure models are on CPU before prepare
+        from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+        is_rocm = is_rocm_available()
+        
+        if is_rocm:
+            synchronize_gpu()
+            # Ensure VAE is on CPU
+            if hasattr(self.sd, 'vae') and self.sd.vae is not None:
+                try:
+                    self.sd.vae.to("cpu")
+                except (RuntimeError, Exception):
+                    pass  # Already on CPU or error handled
+        
         # # prepare all the models stuff for accelerator (hopefully we dont miss any)
-        self.sd.vae = self.accelerator.prepare(self.sd.vae)
+        self.sd.vae = safe_prepare(self.accelerator, self.sd.vae)
         if self.sd.unet is not None:
-            self.sd.unet = self.accelerator.prepare(self.sd.unet)
+            if is_rocm:
+                try:
+                    self.sd.unet.to("cpu")
+                except (RuntimeError, Exception):
+                    pass
+            self.sd.unet = safe_prepare(self.accelerator, self.sd.unet)
             # todo always tdo it?
             self.modules_being_trained.append(self.sd.unet)
         if self.sd.text_encoder is not None and self.train_config.train_text_encoder:
             if isinstance(self.sd.text_encoder, list):
-                self.sd.text_encoder = [self.accelerator.prepare(model) for model in self.sd.text_encoder]
+                if is_rocm:
+                    for te in self.sd.text_encoder:
+                        try:
+                            te.to("cpu")
+                        except (RuntimeError, Exception):
+                            pass
+                self.sd.text_encoder = [safe_prepare(self.accelerator, model) for model in self.sd.text_encoder]
                 self.modules_being_trained.extend(self.sd.text_encoder)
             else:
-                self.sd.text_encoder = self.accelerator.prepare(self.sd.text_encoder)
+                if is_rocm:
+                    try:
+                        self.sd.text_encoder.to("cpu")
+                    except (RuntimeError, Exception):
+                        pass
+                self.sd.text_encoder = safe_prepare(self.accelerator, self.sd.text_encoder)
                 self.modules_being_trained.append(self.sd.text_encoder)
         if self.sd.refiner_unet is not None and self.train_config.train_refiner:
-            self.sd.refiner_unet = self.accelerator.prepare(self.sd.refiner_unet)
+            if is_rocm:
+                try:
+                    self.sd.refiner_unet.to("cpu")
+                except (RuntimeError, Exception):
+                    pass
+            self.sd.refiner_unet = safe_prepare(self.accelerator, self.sd.refiner_unet)
             self.modules_being_trained.append(self.sd.refiner_unet)
         # todo, do we need to do the network or will "unet" get it?
         if self.sd.network is not None:
-            self.sd.network = self.accelerator.prepare(self.sd.network)
+            if is_rocm:
+                try:
+                    self.sd.network.to("cpu")
+                except (RuntimeError, Exception):
+                    pass
+            self.sd.network = safe_prepare(self.accelerator, self.sd.network)
             self.modules_being_trained.append(self.sd.network)
         if self.adapter is not None and self.adapter_config.train:
             # todo adapters may not be a module. need to check
-            self.adapter = self.accelerator.prepare(self.adapter)
+            if is_rocm:
+                try:
+                    self.adapter.to("cpu")
+                except (RuntimeError, Exception):
+                    pass
+            self.adapter = safe_prepare(self.accelerator, self.adapter)
             self.modules_being_trained.append(self.adapter)
         
-        # prepare other things
+        # prepare other things (optimizers and schedulers don't need device placement)
         self.optimizer = self.accelerator.prepare(self.optimizer)
         if self.lr_scheduler is not None:
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
@@ -1504,13 +1552,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.sd.adapter = self.adapter
 
     def run(self):
+        print("[DEBUG] BaseSDTrainProcess.run() - starting")
+        import sys
+        sys.stdout.flush()
+        
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
+        print("[DEBUG] BaseSDTrainProcess.run() - calling BaseTrainProcess.run()")
+        sys.stdout.flush()
         BaseTrainProcess.run(self)
+        
+        print("[DEBUG] BaseSDTrainProcess.run() - BaseTrainProcess.run() completed")
+        sys.stdout.flush()
+        
         params = []
 
         ### HOOK ###
+        print("[DEBUG] BaseSDTrainProcess.run() - calling hook_before_model_load()")
+        sys.stdout.flush()
         self.hook_before_model_load()
+        
+        print("[DEBUG] BaseSDTrainProcess.run() - copying model_config")
+        sys.stdout.flush()
         model_config_to_load = copy.deepcopy(self.model_config)
 
         if self.is_fine_tuning:
@@ -1523,9 +1586,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 model_config_to_load.name_or_path = latest_save_path
                 self.load_training_state_from_metadata(latest_save_path)
 
+        print("[DEBUG] BaseSDTrainProcess.run() - getting model class")
+        import sys
+        sys.stdout.flush()
         ModelClass = get_model_class(self.model_config)
+        print(f"[DEBUG] BaseSDTrainProcess.run() - ModelClass: {ModelClass}")
+        sys.stdout.flush()
+        
         # if the model class has get_train_scheduler static method
         if hasattr(ModelClass, 'get_train_scheduler'):
+            print("[DEBUG] BaseSDTrainProcess.run() - getting train scheduler from ModelClass")
+            sys.stdout.flush()
             sampler = ModelClass.get_train_scheduler()
         else:
             # get the noise scheduler
@@ -1550,6 +1621,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 model_config_to_load.refiner_name_or_path = previous_refiner_save
                 self.load_training_state_from_metadata(previous_refiner_save)
 
+        print("[DEBUG] BaseSDTrainProcess.run() - creating ModelClass instance")
+        import sys
+        sys.stdout.flush()
         self.sd = ModelClass(
             # todo handle single gpu and multi gpu here
             # device=self.device,
@@ -1559,10 +1633,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
             custom_pipeline=self.custom_pipeline,
             noise_scheduler=sampler,
         )
+        print("[DEBUG] BaseSDTrainProcess.run() - ModelClass instance created")
+        sys.stdout.flush()
         
+        print("[DEBUG] BaseSDTrainProcess.run() - calling hook_after_sd_init_before_load()")
+        sys.stdout.flush()
         self.hook_after_sd_init_before_load()
+        
+        # Store save_root (job-specific folder) on model for quantization caching (before load_model so it's available during quantization)
+        # The model (self.sd) will use this during quantization
+        # Use save_root instead of training_folder so cache is job-specific
+        self.sd.training_folder = self.save_root
+        
+        print("[DEBUG] BaseSDTrainProcess.run() - calling sd.load_model()")
+        sys.stdout.flush()
         # run base sd process run
         self.sd.load_model()
+        print("[DEBUG] BaseSDTrainProcess.run() - sd.load_model() completed")
+        sys.stdout.flush()
         
         # compile the model if needed
         if self.model_config.compile:
@@ -1605,9 +1693,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if hasattr(text_encoder, 'set_attention_backend'):
                     text_encoder.set_attention_backend(self.train_config.attention_backend)
         if self.train_config.sdp:
-            torch.backends.cuda.enable_math_sdp(True)
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            from toolkit.backend_utils import is_cuda_available
+            # SDP backends - conditionally enable based on backend support
+            # ROCm may not support all CUDA SDP backends
+            if is_cuda_available():
+                torch.backends.cuda.enable_math_sdp(True)
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+            else:
+                # For ROCm, only enable math SDP if available
+                try:
+                    torch.backends.cuda.enable_math_sdp(True)
+                except AttributeError:
+                    pass  # ROCm may not support all SDP backends
         
         # # check if we have sage and is flux
         # if self.sd.is_flux:
@@ -2163,7 +2261,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
+                error_str = str(e).lower()
+                if "cuda out of memory" in error_str or "hip out of memory" in error_str or "out of memory" in error_str:
                     did_oom = True
                 else:
                     raise  # not an OOM; surface real errors

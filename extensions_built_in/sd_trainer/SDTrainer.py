@@ -42,7 +42,8 @@ from torchvision.transforms import functional as TF
 
 
 def flush():
-    torch.cuda.empty_cache()
+    from toolkit.backend_utils import clear_gpu_cache
+    clear_gpu_cache()
     gc.collect()
 
 
@@ -272,7 +273,28 @@ class SDTrainer(BaseSDTrainProcess):
         # move vae to device if we did not cache latents
         if not self.is_latents_cached:
             self.sd.vae.eval()
-            self.sd.vae.to(self.device_torch)
+            # For ROCm, handle VAE device transfer with error handling
+            try:
+                from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+                is_rocm = is_rocm_available()
+            except ImportError:
+                is_rocm = False
+            
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    self.sd.vae.to(self.device_torch)
+                    synchronize_gpu()
+                except (RuntimeError, Exception) as e:
+                    error_str = str(e)
+                    if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                        # Keep VAE on CPU if device transfer fails
+                        # It will be used on CPU during encode/decode operations
+                        pass
+                    else:
+                        raise
+            else:
+                self.sd.vae.to(self.device_torch)
         else:
             # offload it. Already cached
             self.sd.vae.to('cpu')
@@ -2054,7 +2076,8 @@ class SDTrainer(BaseSDTrainProcess):
             else:
                 total_loss += loss
             if len(batch_list) > 1 and self.model_config.low_vram:
-                torch.cuda.empty_cache()
+                from toolkit.backend_utils import clear_gpu_cache
+                clear_gpu_cache()
 
 
         if not self.is_grad_accumulation_step:

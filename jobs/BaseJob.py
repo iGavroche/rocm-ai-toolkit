@@ -30,11 +30,17 @@ class BaseJob:
             return default
 
     def run(self):
+        print("[DEBUG] BaseJob.run() - starting")
+        import sys
+        sys.stdout.flush()
         print("")
         print(f"#############################################")
         print(f"# Running job: {self.name}")
         print(f"#############################################")
         print("")
+        sys.stdout.flush()
+        print("[DEBUG] BaseJob.run() - completed")
+        sys.stdout.flush()
         # implement in child class
         # be sure to call super().run() first
         pass

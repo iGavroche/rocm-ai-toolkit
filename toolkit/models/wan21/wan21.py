@@ -426,7 +426,13 @@ class Wan21(BaseModel):
             comfy_files=self._comfy_te_file
         )
 
-        text_encoder.to(self.device_torch, dtype=dtype)
+        # For ROCm, handle device transfer carefully
+        from toolkit.backend_utils import is_rocm_available
+        if is_rocm_available():
+            # Keep on CPU initially, Accelerate will handle device placement
+            text_encoder.to('cpu', dtype=dtype)
+        else:
+            text_encoder.to(self.device_torch, dtype=dtype)
         flush()
 
         if self.model_config.quantize_te:
@@ -476,16 +482,56 @@ class Wan21(BaseModel):
         text_encoder = pipe.text_encoder
         tokenizer = pipe.tokenizer
 
-        pipe.transformer = pipe.transformer.to(self.device_torch)
+        # For ROCm, handle device transfers carefully
+        from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+        is_rocm = is_rocm_available()
+        
+        if is_rocm:
+            # ROCm: keep transformer on CPU initially, Accelerate will handle it
+            synchronize_gpu()
+            self.print_and_status_update("ROCm: keeping transformer on CPU (Accelerate will handle device placement)")
+            pipe.transformer = pipe.transformer.cpu()
+        else:
+            pipe.transformer = pipe.transformer.to(self.device_torch)
 
         flush()
-        text_encoder.to(self.device_torch)
+        
+        # Move text encoder to device with ROCm handling
+        if is_rocm:
+            synchronize_gpu()
+            try:
+                text_encoder = text_encoder.cpu()  # Ensure on CPU first
+                text_encoder = text_encoder.to(self.device_torch)
+            except (RuntimeError, Exception) as e:
+                if "HIP" in str(e) or "hipError" in str(e):
+                    self.print_and_status_update(f"Warning: Text encoder device transfer failed on ROCm, keeping on CPU: {e}")
+                    text_encoder = text_encoder.cpu()
+                else:
+                    raise
+        else:
+            text_encoder.to(self.device_torch)
+        
         text_encoder.requires_grad_(False)
         text_encoder.eval()
-        pipe.transformer = pipe.transformer.to(self.device_torch)
+        
+        # Handle transformer again (might be needed for some paths)
+        if is_rocm:
+            # Keep on CPU
+            pipe.transformer = pipe.transformer.cpu()
+        else:
+            pipe.transformer = pipe.transformer.to(self.device_torch)
         flush()
         self.pipeline = pipe
         self.model = transformer
+        
+        # For ROCm, ensure VAE is on CPU before prepare_accelerator()
+        from toolkit.backend_utils import is_rocm_available
+        if is_rocm_available():
+            try:
+                vae.to("cpu")
+            except (RuntimeError, Exception):
+                pass  # Already on CPU or error handled
+        
         self.vae = vae
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
@@ -585,16 +631,75 @@ class Wan21(BaseModel):
         return noise_pred
 
     def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:
+        # For ROCm, handle device transfer with error handling
+        from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+        is_rocm = is_rocm_available()
+        
+        # For ROCm, try to move text encoder to device, but fall back to CPU if it fails
         if self.pipeline.text_encoder.device != self.device_torch:
-            self.pipeline.text_encoder.to(self.device_torch)
-        prompt_embeds, _ = self.pipeline.encode_prompt(
-            prompt,
-            do_classifier_free_guidance=False,
-            max_sequence_length=512,
-            device=self.device_torch,
-            dtype=self.torch_dtype,
-        )
-        return PromptEmbeds(prompt_embeds)
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    # Try to move text encoder to device
+                    self.pipeline.text_encoder.to(self.device_torch)
+                except Exception as e:
+                    # Catch any exception (RuntimeError, AcceleratorError, etc.)
+                    error_str = str(e)
+                    error_type = type(e).__name__
+                    error_type_str = str(type(e))
+                    
+                    is_hip_error = ("HIP" in error_str or "hipError" in error_str or 
+                                   "hipErrorInvalidValue" in error_str or
+                                   "AcceleratorError" in error_type or
+                                   "AcceleratorError" in error_type_str)
+                    
+                    if is_hip_error or isinstance(e, RuntimeError):
+                        # If device transfer fails, keep on CPU and encode there
+                        # The encode_prompt will handle the device placement
+                        self.print_and_status_update(f"Warning: Text encoder device transfer failed on ROCm, encoding on CPU: {error_type}: {error_str[:200]}")
+                        # Ensure it's on CPU
+                        try:
+                            self.pipeline.text_encoder.to("cpu")
+                        except Exception:
+                            pass  # Already on CPU or error handled
+                    else:
+                        raise
+            else:
+                self.pipeline.text_encoder.to(self.device_torch)
+        
+        # For ROCm, if text encoder is on CPU, encode on CPU and keep result on CPU
+        # The PromptEmbeds.to() method will handle device transfers gracefully
+        if is_rocm and self.pipeline.text_encoder.device == torch.device('cpu'):
+            # Encode on CPU, keep result on CPU
+            # Device transfers will be handled by PromptEmbeds.to() with error handling
+            prompt_embeds, _ = self.pipeline.encode_prompt(
+                prompt,
+                do_classifier_free_guidance=False,
+                max_sequence_length=512,
+                device=torch.device('cpu'),  # Encode on CPU
+                dtype=self.torch_dtype,
+            )
+            # Create PromptEmbeds on CPU - it will handle device transfers when needed
+            prompt_embeds_obj = PromptEmbeds(prompt_embeds)
+            # Try to move to device, but PromptEmbeds.to() will handle errors gracefully
+            try:
+                prompt_embeds_obj = prompt_embeds_obj.to(self.device_torch, dtype=self.torch_dtype)
+            except Exception as e:
+                # PromptEmbeds.to() should handle this, but catch any remaining errors
+                error_str = str(e)
+                if "HIP" not in error_str and "hipError" not in error_str:
+                    raise
+                # If it's a HIP error, PromptEmbeds is already handling it
+            return prompt_embeds_obj
+        else:
+            prompt_embeds, _ = self.pipeline.encode_prompt(
+                prompt,
+                do_classifier_free_guidance=False,
+                max_sequence_length=512,
+                device=self.device_torch,
+                dtype=self.torch_dtype,
+            )
+            return PromptEmbeds(prompt_embeds)
 
     @torch.no_grad()
     def encode_images(
