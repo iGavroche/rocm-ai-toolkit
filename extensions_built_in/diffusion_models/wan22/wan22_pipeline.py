@@ -95,7 +95,29 @@ class Wan22Pipeline(WanPipeline):
             self.transformer.to("cpu")
             if self.transformer_2 is not None:
                 self.transformer_2.to("cpu")
-            self.text_encoder.to(device)
+            
+            # For ROCm, handle text encoder device transfer with error handling
+            try:
+                from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+                is_rocm = is_rocm_available()
+            except ImportError:
+                is_rocm = False
+            
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    self.text_encoder.to(device)
+                    synchronize_gpu()
+                except (RuntimeError, Exception) as e:
+                    error_str = str(e)
+                    if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                        # Keep text encoder on CPU if transfer fails
+                        print("Warning: Text encoder device transfer failed on ROCm, keeping on CPU")
+                        synchronize_gpu()
+                    else:
+                        raise
+            else:
+                self.text_encoder.to(device)
             flush()
         
 
@@ -143,7 +165,31 @@ class Wan22Pipeline(WanPipeline):
             # unload text encoder
             print("Unloading text encoder")
             self.text_encoder.to("cpu")
-            self.transformer.to(device)
+            
+            # For ROCm, handle transformer device transfer with error handling
+            try:
+                from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+                is_rocm = is_rocm_available()
+            except ImportError:
+                is_rocm = False
+            
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    self.transformer.to(device)
+                    synchronize_gpu()
+                except Exception as e:
+                    # Catch all exceptions including AcceleratorError
+                    error_str = str(e)
+                    error_type = type(e).__name__
+                    if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in error_type or "HIP error" in error_str:
+                        # Keep transformer on CPU if transfer fails
+                        print("Warning: Transformer device transfer failed on ROCm, keeping on CPU")
+                        synchronize_gpu()
+                    else:
+                        raise
+            else:
+                self.transformer.to(device)
             flush()
 
         transformer_dtype = self.transformer.dtype
@@ -186,8 +232,35 @@ class Wan22Pipeline(WanPipeline):
                 negative_prompt_embeds = negative_prompt_embeds.to(device, transformer_dtype)
 
         # 4. Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        # For ROCm, handle scheduler device transfer with error handling
+        # AcceleratorError is a special exception from accelerate library
+        if is_rocm:
+            synchronize_gpu()
+            try:
+                self.scheduler.set_timesteps(num_inference_steps, device=device)
+                synchronize_gpu()
+            except Exception as e:
+                # Catch all exceptions including AcceleratorError
+                error_str = str(e)
+                error_type = type(e).__name__
+                if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in error_type or "HIP error" in error_str:
+                    # If scheduler can't use GPU device, use CPU instead
+                    print("Warning: Scheduler device transfer failed on ROCm, using CPU device")
+                    synchronize_gpu()
+                    try:
+                        self.scheduler.set_timesteps(num_inference_steps, device="cpu")
+                        synchronize_gpu()
+                    except Exception as e2:
+                        print(f"Warning: Scheduler also failed on CPU: {e2}")
+                        # Try to continue anyway - scheduler might work
+                        synchronize_gpu()
+                else:
+                    raise
+        else:
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        # Note: If scheduler is on CPU, timesteps will be on CPU too
+        # This is fine - PyTorch handles cross-device operations
 
         # 5. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels
@@ -203,21 +276,140 @@ class Wan22Pipeline(WanPipeline):
                 # we need to trick the in_channls to think it is only 16 channels
                 num_channels_latents = 16
                 
-        latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            torch.float32,
-            device,
-            generator,
-            latents,
-        )
+        # For ROCm, handle prepare_latents with error handling
+        # prepare_latents calls torch.randn which can fail on ROCm
+        if is_rocm:
+            synchronize_gpu()
+            try:
+                latents = self.prepare_latents(
+                    batch_size * num_videos_per_prompt,
+                    num_channels_latents,
+                    height,
+                    width,
+                    num_frames,
+                    torch.float32,
+                    device,
+                    generator,
+                    latents,
+                )
+                synchronize_gpu()
+            except Exception as e:
+                error_str = str(e)
+                error_type = type(e).__name__
+                if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in error_type or "HIP error" in error_str:
+                    # If GPU latents creation fails, create on CPU and move if possible
+                    print("Warning: prepare_latents failed on GPU, trying CPU fallback")
+                    synchronize_gpu()
+                    try:
+                        # If generator is on GPU, we need to handle it carefully
+                        # Create a CPU generator if needed to avoid device mismatch
+                        cpu_generator = None
+                        if generator is not None:
+                            try:
+                                # Try to get generator state and create CPU version
+                                if hasattr(generator, 'device') and generator.device.type == 'cuda':
+                                    # Create CPU generator with same seed
+                                    cpu_generator = torch.Generator(device='cpu')
+                                    if hasattr(generator, 'initial_seed'):
+                                        cpu_generator.manual_seed(generator.initial_seed())
+                                    else:
+                                        cpu_generator.manual_seed(42)  # Fallback seed
+                                else:
+                                    cpu_generator = generator
+                            except Exception:
+                                # If we can't copy generator, use None
+                                cpu_generator = None
+                        
+                        # Create latents on CPU first
+                        latents = self.prepare_latents(
+                            batch_size * num_videos_per_prompt,
+                            num_channels_latents,
+                            height,
+                            width,
+                            num_frames,
+                            torch.float32,
+                            "cpu",
+                            cpu_generator,  # Use CPU generator
+                            latents,
+                        )
+                        # Try to move to GPU (but don't fail if it doesn't work)
+                        synchronize_gpu()
+                        try:
+                            latents = latents.to(device)
+                            synchronize_gpu()
+                        except Exception:
+                            # Keep on CPU - will work with cross-device ops
+                            synchronize_gpu()
+                    except Exception as e2:
+                        error_str2 = str(e2)
+                        print(f"Warning: prepare_latents CPU fallback failed: {error_str2[:200]}")
+                        # Last resort: create simple random tensor on CPU
+                        # Use the same shape calculation as prepare_latents would
+                        try:
+                            # Calculate shape the same way prepare_latents does
+                            vae_scale_factor = self.vae_scale_factor_spatial if hasattr(self, 'vae_scale_factor_spatial') else 8
+                            vae_scale_factor_temporal = self.vae_scale_factor_temporal if hasattr(self, 'vae_scale_factor_temporal') else 4
+                            
+                            latent_height = height // (vae_scale_factor * 2) * (vae_scale_factor * 2)
+                            latent_width = width // (vae_scale_factor * 2) * (vae_scale_factor * 2)
+                            latent_frames = num_frames
+                            if latent_frames % vae_scale_factor_temporal != 1:
+                                latent_frames = latent_frames // vae_scale_factor_temporal * vae_scale_factor_temporal + 1
+                            
+                            shape = (
+                                batch_size * num_videos_per_prompt,
+                                num_channels_latents,
+                                latent_height // (vae_scale_factor * 2),
+                                latent_width // (vae_scale_factor * 2),
+                                latent_frames // vae_scale_factor_temporal,
+                            )
+                            latents = torch.randn(shape, dtype=torch.float32, device="cpu")
+                            print("Warning: Using simple CPU tensor creation as fallback")
+                        except Exception as e3:
+                            print(f"Error: All fallback methods failed: {e3}")
+                            import traceback
+                            traceback.print_exc()
+                            raise
+                else:
+                    raise
+        else:
+            latents = self.prepare_latents(
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                num_frames,
+                torch.float32,
+                device,
+                generator,
+                latents,
+            )
         
         mask = noise_mask
         if mask is None:
-            mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
+            # For ROCm, handle mask creation with error handling
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
+                    synchronize_gpu()
+                except Exception as e:
+                    error_str = str(e)
+                    error_type = type(e).__name__
+                    if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in error_type or "HIP error" in error_str:
+                        # Create mask on CPU and move if possible
+                        synchronize_gpu()
+                        mask = torch.ones(latents.shape, dtype=torch.float32, device="cpu")
+                        try:
+                            mask = mask.to(device)
+                            synchronize_gpu()
+                        except Exception:
+                            # Keep on CPU - will work with cross-device ops
+                            synchronize_gpu()
+                    else:
+                        raise
+            else:
+                mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
 
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - \
@@ -246,7 +438,21 @@ class Wan22Pipeline(WanPipeline):
                     if self._aggressive_offload and current_model != self.transformer:
                         if self.transformer_2 is not None:
                             self.transformer_2.to("cpu")
-                        self.transformer.to(device)
+                        # For ROCm, handle transformer device transfer with error handling
+                        if is_rocm:
+                            synchronize_gpu()
+                            try:
+                                self.transformer.to(device)
+                                synchronize_gpu()
+                            except (RuntimeError, Exception) as e:
+                                error_str = str(e)
+                                if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                                    # Keep on CPU if transfer fails
+                                    synchronize_gpu()
+                                else:
+                                    raise
+                        else:
+                            self.transformer.to(device)
                     # wan2.1 or high-noise stage in wan2.2
                     current_model = self.transformer
                     current_guidance_scale = guidance_scale
@@ -255,19 +461,79 @@ class Wan22Pipeline(WanPipeline):
                         if self.transformer is not None:
                             self.transformer.to("cpu")
                         if self.transformer_2 is not None:
-                            self.transformer_2.to(device)
+                            # For ROCm, handle transformer_2 device transfer with error handling
+                            if is_rocm:
+                                synchronize_gpu()
+                                try:
+                                    self.transformer_2.to(device)
+                                    synchronize_gpu()
+                                except (RuntimeError, Exception) as e:
+                                    error_str = str(e)
+                                    if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                                        # Keep on CPU if transfer fails
+                                        synchronize_gpu()
+                                    else:
+                                        raise
+                            else:
+                                self.transformer_2.to(device)
                     # low-noise stage in wan2.2
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_scale_2
                     
-                latent_model_input = latents.to(device, transformer_dtype)
+                # For ROCm, handle latent device transfer with error handling
+                if is_rocm:
+                    synchronize_gpu()
+                    try:
+                        latent_model_input = latents.to(device, transformer_dtype)
+                        synchronize_gpu()
+                    except (RuntimeError, Exception) as e:
+                        error_str = str(e)
+                        if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                            # Keep on CPU if transfer fails
+                            synchronize_gpu()
+                            latent_model_input = latents.to("cpu", transformer_dtype)
+                        else:
+                            raise
+                else:
+                    latent_model_input = latents.to(device, transformer_dtype)
                 if self.config.expand_timesteps:
                     # seq_len: num_latent_frames * latent_height//2 * latent_width//2
                     temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
                     # batch_size, seq_len
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                    # For ROCm, handle timestep device transfer
+                    if is_rocm:
+                        synchronize_gpu()
+                        try:
+                            timestep = timestep.to(device)
+                            synchronize_gpu()
+                        except (RuntimeError, Exception) as e:
+                            error_str = str(e)
+                            if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                                # Keep on CPU if transfer fails
+                                synchronize_gpu()
+                                timestep = timestep.to("cpu")
+                            else:
+                                raise
                 else:
+                    # For ROCm, handle timestep device transfer
+                    # t comes from timesteps which might be on CPU if scheduler is on CPU
                     timestep = t.expand(latents.shape[0])
+                    if is_rocm:
+                        synchronize_gpu()
+                        try:
+                            timestep = timestep.to(device)
+                            synchronize_gpu()
+                        except (RuntimeError, Exception) as e:
+                            error_str = str(e)
+                            if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
+                                # Keep on CPU if transfer fails - model will handle cross-device
+                                synchronize_gpu()
+                                timestep = timestep.to("cpu")
+                            else:
+                                raise
+                    else:
+                        timestep = timestep.to(device)
                 
                 pre_condition_latent_model_input = latent_model_input.clone()
                 

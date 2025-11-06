@@ -38,10 +38,12 @@ class LoRAModule(torch.nn.Module):
         super().__init__()
         self.lora_name = lora_name
 
+        # Support various Linear module types including quantized ones
         if org_module.__class__.__name__ == "Conv2d":
             in_dim = org_module.in_channels
             out_dim = org_module.out_channels
         else:
+            # Works for Linear, LoRACompatibleLinear, QLinear, Linear8bitLt, etc.
             in_dim = org_module.in_features
             out_dim = org_module.out_features
 
@@ -819,7 +821,8 @@ class LoRANetwork(torch.nn.Module):
             for name, module in root_module.named_modules():
                 if module.__class__.__name__ in target_replace_modules:
                     for child_name, child_module in module.named_modules():
-                        is_linear = child_module.__class__.__name__ == "Linear"
+                        # Support various Linear module types including quantized ones
+                        is_linear = child_module.__class__.__name__ in ["Linear", "LoRACompatibleLinear", "QLinear", "Linear8bitLt"]
                         is_conv2d = child_module.__class__.__name__ == "Conv2d"
                         is_conv2d_1x1 = is_conv2d and child_module.kernel_size == (1, 1)
 

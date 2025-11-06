@@ -62,7 +62,74 @@ export PYTORCH_ROCM_ARCH="gfx1151"
 export ROCBLAS_USE_HIPBLASLT=1  # For optimized performance
 ```
 
-### 5. Install Project Dependencies
+### 5. Build and Install bitsandbytes ROCm (Optional but Recommended)
+
+For GPU quantization support on ROCm, you need to build bitsandbytes from source with ROCm support:
+
+```bash
+# Clone bitsandbytes repository
+cd ~
+git clone --recurse https://github.com/ROCm/bitsandbytes.git bitsandbytes-rocm
+cd bitsandbytes-rocm
+
+# Checkout ROCm-enabled branch (if available)
+# git checkout rocm_enabled  # Uncomment if branch exists
+
+# Install build dependencies
+source /path/to/ai-toolkit/.venv/bin/activate  # Activate your ai-toolkit venv
+pip install -r requirements-dev.txt
+
+# Configure CMake for ROCm with your GPU architecture
+# Replace gfx1151 with your GPU architecture if different
+cmake -B build \
+  -DCOMPUTE_BACKEND=hip \
+  -DBNB_ROCM_ARCH=gfx1151 \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1151
+
+# Build bitsandbytes
+cmake --build build
+
+# Copy the built ROCm library to your venv
+# The library name depends on your ROCm version (e.g., rocm71, rocm78)
+# Check your ROCm version: rocm-smi --version
+python3 << 'EOF'
+import bitsandbytes
+import os
+import shutil
+
+# Get bitsandbytes install directory
+bnb_dir = os.path.dirname(bitsandbytes.__file__)
+print(f"bitsandbytes install dir: {bnb_dir}")
+
+# Find the built ROCm library
+import subprocess
+result = subprocess.run(['rocm-smi', '--version'], capture_output=True, text=True)
+if result.returncode == 0:
+    version_line = [l for l in result.stdout.split('\n') if 'ROCM-SMI-LIB version' in l]
+    if version_line:
+        rocm_version = version_line[0].split()[-1]
+        major_minor = rocm_version.split('.')[:2]
+        rocm_id = ''.join(major_minor)
+        lib_name = f"libbitsandbytes_rocm{rocm_id}.so"
+        print(f"Expected library: {lib_name}")
+        
+        # Copy from build directory
+        src = f"bitsandbytes/{lib_name}"
+        if os.path.exists(src):
+            dst = os.path.join(bnb_dir, lib_name)
+            shutil.copy2(src, dst)
+            print(f"✓ Copied {src} to {dst}")
+        else:
+            print(f"Warning: {src} not found. Check build directory.")
+EOF
+
+# Verify installation
+python3 -c "import bitsandbytes as bnb; print('bitsandbytes ROCm:', bnb.__version__)"
+```
+
+**Note**: The library name (`libbitsandbytes_rocm71.so`, `libbitsandbytes_rocm78.so`, etc.) depends on your ROCm version. The script above automatically detects and copies the correct library.
+
+### 6. Install Project Dependencies
 
 ```bash
 cd /path/to/ai-toolkit
