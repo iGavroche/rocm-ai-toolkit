@@ -342,13 +342,25 @@ class Wan21(BaseModel):
         return scheduler
     
     def load_wan_transformer(self, transformer_path, subfolder=None):
-        self.print_and_status_update("Loading transformer")
+        self.print_and_status_update(f"Loading transformer from: {transformer_path}")
+        if subfolder:
+            self.print_and_status_update(f"  Subfolder: {subfolder}")
+        self.print_and_status_update("  This may download from HuggingFace if not cached...")
         dtype = self.torch_dtype
-        transformer = WanTransformer3DModel.from_pretrained(
-            transformer_path,
-            subfolder=subfolder,
-            torch_dtype=dtype,
-        ).to(dtype=dtype)
+        try:
+            transformer = WanTransformer3DModel.from_pretrained(
+                transformer_path,
+                subfolder=subfolder,
+                torch_dtype=dtype,
+            ).to(dtype=dtype)
+            self.print_and_status_update("  Transformer loaded successfully")
+        except Exception as e:
+            self.print_and_status_update(f"  ERROR loading transformer: {e}")
+            self.print_and_status_update(f"  This could be due to:")
+            self.print_and_status_update(f"    - Network issues preventing download from HuggingFace")
+            self.print_and_status_update(f"    - Insufficient disk space")
+            self.print_and_status_update(f"    - Invalid model path: {transformer_path}")
+            raise
 
         if self.model_config.split_model_over_gpus:
             raise ValueError(
@@ -394,7 +406,8 @@ class Wan21(BaseModel):
         dtype = self.torch_dtype
         model_path = self.model_config.name_or_path
 
-        self.print_and_status_update("Loading Wan model")
+        self.print_and_status_update(f"Loading Wan model from: {model_path}")
+        self.print_and_status_update("Note: This may download a large model from HuggingFace if not already cached. This can take several minutes.")
         subfolder = 'transformer'
         transformer_path = model_path
         if os.path.exists(transformer_path):
@@ -416,30 +429,116 @@ class Wan21(BaseModel):
 
         flush()
 
-        self.print_and_status_update("Loading UMT5EncoderModel")
+        self.print_and_status_update(f"Loading UMT5EncoderModel from: {te_path}")
+        self.print_and_status_update("  This may download from HuggingFace if not cached...")
         
-        tokenizer, text_encoder = get_umt5_encoder(
-            model_path=te_path,
-            tokenizer_subfolder="tokenizer",
-            encoder_subfolder="text_encoder",
-            torch_dtype=dtype,
-            comfy_files=self._comfy_te_file
-        )
+        try:
+            tokenizer, text_encoder = get_umt5_encoder(
+                model_path=te_path,
+                tokenizer_subfolder="tokenizer",
+                encoder_subfolder="text_encoder",
+                torch_dtype=dtype,
+                comfy_files=self._comfy_te_file
+            )
+            self.print_and_status_update("  UMT5EncoderModel loaded successfully")
+        except Exception as e:
+            self.print_and_status_update(f"  ERROR loading UMT5EncoderModel: {e}")
+            raise
 
-        # For ROCm, handle device transfer carefully
-        from toolkit.backend_utils import is_rocm_available
-        if is_rocm_available():
-            # Keep on CPU initially, Accelerate will handle device placement
-            text_encoder.to('cpu', dtype=dtype)
-        else:
-            text_encoder.to(self.device_torch, dtype=dtype)
-        flush()
+        # Check available GPU memory and decide dynamically
+        # Text encoder is ~11 GB unquantized, ~3-4 GB quantized
+        try:
+            import torch
+            device = torch.cuda.current_device() if torch.cuda.is_available() else None
+            if device is not None:
+                total_mem = torch.cuda.get_device_properties(device).total_memory / 1024**3
+                reserved_mem = torch.cuda.memory_reserved(device) / 1024**3
+                allocated_mem = torch.cuda.memory_allocated(device) / 1024**3
+                available_mem = (total_mem - reserved_mem) * 0.9  # 90% to account for fragmentation
+                self.print_and_status_update(f"GPU memory before text encoder: {available_mem:.2f} GB available / {total_mem:.2f} GB total")
+                
+                # Estimate text encoder size
+                estimated_te_gb = 4.0 if self.model_config.quantize_te else 11.0
+                
+                # Clear GPU cache before attempting to move
+                torch.cuda.empty_cache()
+                flush()
+                
+                # If we're going to quantize, keep on CPU for quantization, then move to GPU
+                # Otherwise try to move to GPU immediately if we have space
+                if not self.model_config.quantize_te:
+                    if available_mem > estimated_te_gb:
+                        try:
+                            self.print_and_status_update(f"Moving UMT5EncoderModel to GPU ({available_mem:.2f} GB available)")
+                            text_encoder.to(self.device_torch, dtype=dtype)
+                            torch.cuda.empty_cache()
+                            flush()
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                                self.print_and_status_update("OOM moving text encoder to GPU - keeping on CPU")
+                            else:
+                                raise
+                    else:
+                        self.print_and_status_update(f"Insufficient GPU memory ({available_mem:.2f} GB available), keeping text encoder on CPU")
 
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing UMT5EncoderModel")
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype))
-            freeze(text_encoder)
+                if self.model_config.quantize_te:
+                    self.print_and_status_update("Quantizing UMT5EncoderModel (on CPU)")
+                    quantize(text_encoder, weights=get_qtype(self.model_config.qtype))
+                    freeze(text_encoder)
+                    torch.cuda.empty_cache()
+                    flush()
+                    # After quantization, check memory again and move to GPU if possible
+                    if device is not None:
+                        available_mem = (torch.cuda.get_device_properties(device).total_memory / 1024**3 - 
+                                       torch.cuda.memory_reserved(device) / 1024**3) * 0.9
+                        if available_mem > estimated_te_gb:
+                            try:
+                                self.print_and_status_update(f"Moving quantized UMT5EncoderModel to GPU ({available_mem:.2f} GB available)")
+                                text_encoder.to(self.device_torch, dtype=dtype)
+                                torch.cuda.empty_cache()
+                                flush()
+                                self.print_and_status_update("Quantized UMT5EncoderModel moved to GPU successfully")
+                            except RuntimeError as e:
+                                if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                                    self.print_and_status_update("OOM moving quantized text encoder to GPU - keeping on CPU")
+                                else:
+                                    raise
+                        else:
+                            self.print_and_status_update(f"Insufficient GPU memory ({available_mem:.2f} GB available), keeping quantized text encoder on CPU")
+        except Exception as e:
+            # Fallback to original conservative logic
+            self.print_and_status_update(f"Could not check GPU memory: {e}, using conservative approach")
+            torch.cuda.empty_cache()
             flush()
+            
+            if not self.model_config.quantize_te:
+                try:
+                    self.print_and_status_update("Moving UMT5EncoderModel to GPU")
+                    text_encoder.to(self.device_torch, dtype=dtype)
+                    torch.cuda.empty_cache()
+                    flush()
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                        self.print_and_status_update("OOM moving text encoder to GPU - keeping on CPU")
+                    else:
+                        raise
+
+            if self.model_config.quantize_te:
+                self.print_and_status_update("Quantizing UMT5EncoderModel (on CPU)")
+                quantize(text_encoder, weights=get_qtype(self.model_config.qtype))
+                freeze(text_encoder)
+                torch.cuda.empty_cache()
+                flush()
+                try:
+                    self.print_and_status_update("Moving quantized UMT5EncoderModel to GPU")
+                    text_encoder.to(self.device_torch, dtype=dtype)
+                    torch.cuda.empty_cache()
+                    flush()
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                        self.print_and_status_update("OOM moving quantized text encoder to GPU - keeping on CPU")
+                    else:
+                        raise
         
         if self.model_config.layer_offloading and self.model_config.layer_offloading_text_encoder_percent > 0:
             MemoryManager.attach(
@@ -454,16 +553,22 @@ class Wan21(BaseModel):
             transformer.to(self.device_torch)
 
         scheduler = Wan21.get_train_scheduler()
-        self.print_and_status_update("Loading VAE")
+        self.print_and_status_update(f"Loading VAE from: {vae_path if self._wan_vae_path is None else self._wan_vae_path}")
+        self.print_and_status_update("  This may download from HuggingFace if not cached...")
         # todo, example does float 32? check if quality suffers
         
-        if self._wan_vae_path is not None:
-            # load the vae from individual repo
-            vae = AutoencoderKLWan.from_pretrained(
-                self._wan_vae_path, torch_dtype=dtype).to(dtype=dtype)
-        else:
-            vae = AutoencoderKLWan.from_pretrained(
-                vae_path, subfolder="vae", torch_dtype=dtype).to(dtype=dtype)
+        try:
+            if self._wan_vae_path is not None:
+                # load the vae from individual repo
+                vae = AutoencoderKLWan.from_pretrained(
+                    self._wan_vae_path, torch_dtype=dtype).to(dtype=dtype)
+            else:
+                vae = AutoencoderKLWan.from_pretrained(
+                    vae_path, subfolder="vae", torch_dtype=dtype).to(dtype=dtype)
+            self.print_and_status_update("  VAE loaded successfully")
+        except Exception as e:
+            self.print_and_status_update(f"  ERROR loading VAE: {e}")
+            raise
         flush()
 
         self.print_and_status_update("Making pipe")
@@ -482,56 +587,16 @@ class Wan21(BaseModel):
         text_encoder = pipe.text_encoder
         tokenizer = pipe.tokenizer
 
-        # For ROCm, handle device transfers carefully
-        from toolkit.backend_utils import is_rocm_available, synchronize_gpu
-        is_rocm = is_rocm_available()
-        
-        if is_rocm:
-            # ROCm: keep transformer on CPU initially, Accelerate will handle it
-            synchronize_gpu()
-            self.print_and_status_update("ROCm: keeping transformer on CPU (Accelerate will handle device placement)")
-            pipe.transformer = pipe.transformer.cpu()
-        else:
-            pipe.transformer = pipe.transformer.to(self.device_torch)
+        pipe.transformer = pipe.transformer.to(self.device_torch)
 
         flush()
-        
-        # Move text encoder to device with ROCm handling
-        if is_rocm:
-            synchronize_gpu()
-            try:
-                text_encoder = text_encoder.cpu()  # Ensure on CPU first
-                text_encoder = text_encoder.to(self.device_torch)
-            except (RuntimeError, Exception) as e:
-                if "HIP" in str(e) or "hipError" in str(e):
-                    self.print_and_status_update(f"Warning: Text encoder device transfer failed on ROCm, keeping on CPU: {e}")
-                    text_encoder = text_encoder.cpu()
-                else:
-                    raise
-        else:
-            text_encoder.to(self.device_torch)
-        
+        text_encoder.to(self.device_torch)
         text_encoder.requires_grad_(False)
         text_encoder.eval()
-        
-        # Handle transformer again (might be needed for some paths)
-        if is_rocm:
-            # Keep on CPU
-            pipe.transformer = pipe.transformer.cpu()
-        else:
-            pipe.transformer = pipe.transformer.to(self.device_torch)
+        pipe.transformer = pipe.transformer.to(self.device_torch)
         flush()
         self.pipeline = pipe
         self.model = transformer
-        
-        # For ROCm, ensure VAE is on CPU before prepare_accelerator()
-        from toolkit.backend_utils import is_rocm_available
-        if is_rocm_available():
-            try:
-                vae.to("cpu")
-            except (RuntimeError, Exception):
-                pass  # Already on CPU or error handled
-        
         self.vae = vae
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
@@ -631,75 +696,220 @@ class Wan21(BaseModel):
         return noise_pred
 
     def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:
-        # For ROCm, handle device transfer with error handling
-        from toolkit.backend_utils import is_rocm_available, synchronize_gpu
-        is_rocm = is_rocm_available()
-        
-        # For ROCm, try to move text encoder to device, but fall back to CPU if it fails
-        if self.pipeline.text_encoder.device != self.device_torch:
-            if is_rocm:
-                synchronize_gpu()
-                try:
-                    # Try to move text encoder to device
-                    self.pipeline.text_encoder.to(self.device_torch)
-                except Exception as e:
-                    # Catch any exception (RuntimeError, AcceleratorError, etc.)
-                    error_str = str(e)
-                    error_type = type(e).__name__
-                    error_type_str = str(type(e))
-                    
-                    is_hip_error = ("HIP" in error_str or "hipError" in error_str or 
-                                   "hipErrorInvalidValue" in error_str or
-                                   "AcceleratorError" in error_type or
-                                   "AcceleratorError" in error_type_str)
-                    
-                    if is_hip_error or isinstance(e, RuntimeError):
-                        # If device transfer fails, keep on CPU and encode there
-                        # The encode_prompt will handle the device placement
-                        self.print_and_status_update(f"Warning: Text encoder device transfer failed on ROCm, encoding on CPU: {error_type}: {error_str[:200]}")
-                        # Ensure it's on CPU
-                        try:
-                            self.pipeline.text_encoder.to("cpu")
-                        except Exception:
-                            pass  # Already on CPU or error handled
-                    else:
-                        raise
-            else:
-                self.pipeline.text_encoder.to(self.device_torch)
-        
-        # For ROCm, if text encoder is on CPU, encode on CPU and keep result on CPU
-        # The PromptEmbeds.to() method will handle device transfers gracefully
-        if is_rocm and self.pipeline.text_encoder.device == torch.device('cpu'):
-            # Encode on CPU, keep result on CPU
-            # Device transfers will be handled by PromptEmbeds.to() with error handling
-            prompt_embeds, _ = self.pipeline.encode_prompt(
-                prompt,
-                do_classifier_free_guidance=False,
-                max_sequence_length=512,
-                device=torch.device('cpu'),  # Encode on CPU
-                dtype=self.torch_dtype,
-            )
-            # Create PromptEmbeds on CPU - it will handle device transfers when needed
-            prompt_embeds_obj = PromptEmbeds(prompt_embeds)
-            # Try to move to device, but PromptEmbeds.to() will handle errors gracefully
-            try:
-                prompt_embeds_obj = prompt_embeds_obj.to(self.device_torch, dtype=self.torch_dtype)
-            except Exception as e:
-                # PromptEmbeds.to() should handle this, but catch any remaining errors
-                error_str = str(e)
-                if "HIP" not in error_str and "hipError" not in error_str:
-                    raise
-                # If it's a HIP error, PromptEmbeds is already handling it
-            return prompt_embeds_obj
+        # Check actual device from parameters (more reliable than .device attribute)
+        text_encoder_params = list(self.pipeline.text_encoder.parameters())
+        if len(text_encoder_params) > 0:
+            actual_device = next(iter(text_encoder_params)).device
         else:
-            prompt_embeds, _ = self.pipeline.encode_prompt(
-                prompt,
-                do_classifier_free_guidance=False,
-                max_sequence_length=512,
-                device=self.device_torch,
-                dtype=self.torch_dtype,
-            )
-            return PromptEmbeds(prompt_embeds)
+            actual_device = torch.device('cpu')
+        
+        # Normalize devices for comparison (cuda:0 == cuda)
+        # Convert both to string and normalize (cuda:0 -> cuda, cuda -> cuda)
+        actual_str = str(actual_device)
+        target_str = str(self.device_torch)
+        
+        # Normalize: remove :0 suffix if present, both should become 'cuda'
+        if actual_str.startswith('cuda'):
+            actual_normalized = 'cuda' + (actual_str.split(':')[1] if ':' in actual_str else '')
+        else:
+            actual_normalized = actual_str
+            
+        if target_str.startswith('cuda'):
+            target_normalized = 'cuda' + (target_str.split(':')[1] if ':' in target_str else '')
+        else:
+            target_normalized = target_str
+        
+        # For CUDA devices, just check if they're both CUDA (index doesn't matter for single GPU)
+        if actual_str.startswith('cuda') and target_str.startswith('cuda'):
+            devices_match = True  # Both are CUDA, that's good enough
+        else:
+            devices_match = actual_device == self.device_torch
+        
+        if not devices_match:
+            # CRITICAL: On ROCm with PYTORCH_NO_HIP_MEMORY_CACHING=1, model.to(device) can hang indefinitely
+            # This is a known issue with large model moves when the caching allocator is disabled
+            print(f"WARNING: Text encoder is on {actual_device}, needs to move to {self.device_torch}")
+            print(f"WARNING: This move may hang on ROCm with PYTORCH_NO_HIP_MEMORY_CACHING=1")
+            print(f"Attempting move - if this hangs, consider removing PYTORCH_NO_HIP_MEMORY_CACHING=1")
+            
+            # Clear cache before move
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            # Attempt the move - this may hang
+            self.pipeline.text_encoder.to(self.device_torch)
+            torch.cuda.synchronize()
+            print(f"Text encoder moved successfully to {self.device_torch}")
+        
+        print(f"Calling pipeline.encode_prompt() with prompt: {prompt[:50]}...")
+        print(f"  Device: {self.device_torch}, dtype: {self.torch_dtype}")
+        print(f"  Text encoder device: {next(iter(self.pipeline.text_encoder.parameters())).device}")
+        
+        # Check memory before encoding
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            total_mem = torch.cuda.get_device_properties(device).total_memory / 1024**3
+            reserved_mem = torch.cuda.memory_reserved(device) / 1024**3
+            allocated_mem = torch.cuda.memory_allocated(device) / 1024**3
+            free_mem = total_mem - reserved_mem
+            print(f"  Memory before encode_prompt: {free_mem:.2f} GB free / {total_mem:.2f} GB total")
+        
+        print(f"  Starting encode_prompt call (this may take time on ROCm)...")
+        
+        # WORKAROUND: On ROCm with PYTORCH_NO_HIP_MEMORY_CACHING=1, pipeline.encode_prompt() can hang
+        # Bypass the pipeline and call the text encoder directly (same as isolated test)
+        use_direct_call = os.environ.get('PYTORCH_NO_HIP_MEMORY_CACHING') == '1'
+        
+        if use_direct_call:
+            print(f"  WORKAROUND: Bypassing pipeline.encode_prompt() and calling text encoder directly")
+            print(f"  This avoids a known ROCm hang in pipeline.encode_prompt()")
+            
+            try:
+                # Get tokenizer and text encoder (this should be fast)
+                print(f"  Getting tokenizer and text encoder from pipeline...")
+                tokenizer = self.pipeline.tokenizer
+                print(f"  Tokenizer retrieved: {type(tokenizer).__name__}")
+                text_encoder = self.pipeline.text_encoder
+                print(f"  Text encoder retrieved: {type(text_encoder).__name__}")
+                
+                # Tokenize
+                print(f"  Tokenizing prompt...")
+                
+                # Check text encoder state
+                print(f"  Text encoder type: {type(text_encoder).__name__}")
+                print(f"  Text encoder device: {next(iter(text_encoder.parameters())).device}")
+                is_quantized = False
+                try:
+                    from toolkit.util.quantize import is_model_quantized
+                    is_quantized = is_model_quantized(text_encoder)
+                    print(f"  Text encoder is quantized: {is_quantized}")
+                except Exception as e:
+                    print(f"  Could not check quantization status: {e}")
+                    is_quantized = False
+                
+                # Convert prompt to list if needed
+                if isinstance(prompt, str):
+                    prompts = [prompt]
+                else:
+                    prompts = prompt
+                
+                # Call encode_prompts_auraflow directly (same as pipeline.encode_prompt does internally)
+                print(f"  Calling encode_prompts_auraflow directly...")
+                print(f"  Step 1: About to tokenize...")
+                
+                # Tokenize first (this should be fast)
+                text_inputs = tokenizer(
+                    prompts,
+                    truncation=True,
+                    max_length=512,
+                    padding="max_length",
+                    return_tensors="pt",
+                )
+                print(f"  Step 2: Tokenization complete, moving to device...")
+                
+                # Move to device
+                device = text_encoder.device if hasattr(text_encoder, 'device') else next(iter(text_encoder.parameters())).device
+                text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+                print(f"  Step 3: Inputs moved to {device}, about to call text_encoder.forward()...")
+                print(f"  Step 4: This is where it may hang on ROCm...")
+                
+                # Call text encoder directly with explicit diagnostics
+                import time
+                start_time = time.time()
+                print(f"  Step 5: Starting text_encoder forward pass at {start_time:.2f}...")
+                
+                # WORKAROUND: If quantized, run on CPU to avoid ROCm hang
+                # We'll use a temporary copy to avoid modifying the pipeline's text encoder
+                text_encoder_original_device = next(iter(text_encoder.parameters())).device
+                run_on_cpu = is_quantized and text_encoder_original_device.type == 'cuda'
+                
+                if run_on_cpu:
+                    print(f"  WORKAROUND: Text encoder is quantized - running forward pass on CPU")
+                    print(f"  This avoids a ROCm hang with quantized models + PYTORCH_NO_HIP_MEMORY_CACHING=1")
+                    # Move inputs to CPU (don't modify the model itself)
+                    text_inputs_cpu = {k: v.cpu() for k, v in text_inputs.items()}
+                    print(f"  Moved inputs to CPU for forward pass")
+                else:
+                    text_inputs_cpu = text_inputs
+                
+                try:
+                    with torch.no_grad():
+                        # Call forward pass directly
+                        print(f"  Step 5a: Calling text_encoder.forward()...")
+                        if run_on_cpu:
+                            # Temporarily move model to CPU for forward pass
+                            self.pipeline.text_encoder = self.pipeline.text_encoder.cpu()
+                        encoder_outputs = self.pipeline.text_encoder(**text_inputs_cpu)
+                        
+                        # Extract hidden states properly (UMT5 returns BaseModelOutputWithPastAndCrossAttentions)
+                        if hasattr(encoder_outputs, 'last_hidden_state'):
+                            prompt_embeds = encoder_outputs.last_hidden_state
+                        elif isinstance(encoder_outputs, tuple):
+                            prompt_embeds = encoder_outputs[0]
+                        else:
+                            prompt_embeds = encoder_outputs
+                        
+                        print(f"  Step 5b: Forward pass returned, shape: {prompt_embeds.shape}")
+                        
+                        # Move result back to GPU if we ran on CPU
+                        if run_on_cpu:
+                            print(f"  Moving prompt_embeds back to GPU...")
+                            prompt_embeds = prompt_embeds.to(device=text_encoder_original_device)
+                            print(f"  Prompt embeds moved to {text_encoder_original_device}")
+                finally:
+                    # ALWAYS restore model to original device if we moved it
+                    if run_on_cpu:
+                        current_device = next(iter(self.pipeline.text_encoder.parameters())).device
+                        if current_device != text_encoder_original_device:
+                            self.pipeline.text_encoder = self.pipeline.text_encoder.to(text_encoder_original_device)
+                            print(f"  Restored text encoder to {text_encoder_original_device}")
+                
+                elapsed = time.time() - start_time
+                print(f"  Step 6: Text encoder forward pass completed in {elapsed:.2f} seconds")
+                
+                # Create attention mask
+                prompt_attention_mask = text_inputs["attention_mask"].unsqueeze(-1).expand(prompt_embeds.shape)
+                prompt_embeds = prompt_embeds * prompt_attention_mask
+                print(f"  Step 7: Attention mask applied")
+                
+                # Move to correct device/dtype
+                prompt_embeds = prompt_embeds.to(device=self.device_torch, dtype=self.torch_dtype)
+                print(f"  Direct encode completed successfully")
+                print(f"  Prompt embeds shape: {prompt_embeds.shape}")
+                
+            except Exception as e:
+                print(f"  ERROR in direct encode: {e}")
+                print(f"  Falling back to pipeline.encode_prompt()...")
+                import traceback
+                print(f"  Traceback: {traceback.format_exc()}")
+                # Fall through to pipeline.encode_prompt
+                use_direct_call = False
+        
+        if not use_direct_call:
+            try:
+                prompt_embeds, _ = self.pipeline.encode_prompt(
+                    prompt,
+                    do_classifier_free_guidance=False,
+                    max_sequence_length=512,
+                    device=self.device_torch,
+                    dtype=self.torch_dtype,
+                )
+                print(f"  encode_prompt completed successfully")
+                print(f"  Prompt embeds shape: {prompt_embeds.shape if hasattr(prompt_embeds, 'shape') else 'N/A'}")
+            except Exception as e:
+                print(f"  ERROR in encode_prompt: {e}")
+                print(f"  Error type: {type(e).__name__}")
+                import traceback
+                print(f"  Traceback: {traceback.format_exc()}")
+                raise
+        
+        # Extract prompt_embeds from tuple if needed
+        if isinstance(prompt_embeds, tuple):
+            prompt_embeds = prompt_embeds[0]
+        
+        return PromptEmbeds(prompt_embeds)
 
     @torch.no_grad()
     def encode_images(

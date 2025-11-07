@@ -6,6 +6,20 @@ import torch
 import yaml
 from toolkit.accelerator import unwrap_model
 from toolkit.basic import flush
+
+
+def get_available_gpu_memory_gb(device=None):
+    """Get available GPU memory in GB, accounting for fragmentation."""
+    if device is None:
+        device = torch.cuda.current_device()
+    total_memory = torch.cuda.get_device_properties(device).total_memory / 1024**3
+    reserved_memory = torch.cuda.memory_reserved(device) / 1024**3
+    allocated_memory = torch.cuda.memory_allocated(device) / 1024**3
+    # Available = total - reserved (reserved is what PyTorch has reserved from the OS)
+    available_memory = total_memory - reserved_memory
+    # Account for some fragmentation - use 90% of available as safe
+    safe_available = available_memory * 0.9
+    return safe_available, total_memory, reserved_memory, allocated_memory
 from toolkit.models.wan21.wan_utils import add_first_frame_conditioning
 from toolkit.prompt_utils import PromptEmbeds
 from PIL import Image
@@ -133,22 +147,8 @@ class DualWanTransformer3DModel(torch.nn.Module):
             if t_name != self._active_transformer_name:
                 if self.low_vram:
                     getattr(self, self._active_transformer_name).to("cpu")
-                    # For ROCm, handle device transfer carefully
-                    from toolkit.backend_utils import is_rocm_available
-                    if is_rocm_available():
-                        # On ROCm, try to move but catch errors
-                        try:
-                            getattr(self, t_name).to(self.device_torch)
-                        except (RuntimeError, Exception) as e:
-                            if "HIP" in str(e) or "hipError" in str(e):
-                                # Keep on CPU if HIP error occurs
-                                pass
-                            else:
-                                raise
-                    else:
-                        getattr(self, t_name).to(self.device_torch)
-                    from toolkit.backend_utils import clear_gpu_cache
-                    clear_gpu_cache()
+                    getattr(self, t_name).to(self.device_torch)
+                    torch.cuda.empty_cache()
                 self._active_transformer_name = t_name
 
         if self.transformer.device != hidden_states.device:
@@ -159,25 +159,7 @@ class DualWanTransformer3DModel(torch.nn.Module):
                 )
                 getattr(self, other_tname).to("cpu")
 
-            # For ROCm, handle device transfer carefully to avoid HIP errors
-            from toolkit.backend_utils import is_rocm_available
-            if is_rocm_available():
-                # On ROCm, only move if really necessary and catch errors
-                try:
-                    target_device = hidden_states.device
-                    if self.transformer.device != target_device:
-                        self.transformer.to(target_device)
-                except (RuntimeError, Exception) as e:
-                    if "HIP" in str(e) or "hipError" in str(e):
-                        # If HIP error, try to sync and continue
-                        # The model might already be on the correct device due to async errors
-                        import torch
-                        torch.cuda.synchronize() if torch.cuda.is_available() else None
-                        # Don't raise - let it continue and see if it works
-                    else:
-                        raise
-            else:
-                self.transformer.to(hidden_states.device)
+            self.transformer.to(hidden_states.device)
 
         return self.transformer(
             hidden_states=hidden_states,
@@ -262,6 +244,24 @@ class Wan2214bModel(Wan21):
         # we have to split up the model on the pipeline
         self.pipeline.transformer = self.model.transformer_1
         self.pipeline.transformer_2 = self.model.transformer_2
+        
+        # CRITICAL: In low_vram mode, move transformer_1 to GPU for baseline sample generation
+        # The DualWanTransformer3DModel will handle swapping transformers during inference
+        if self.model_config.low_vram:
+            self.print_and_status_update("Moving transformer_1 to GPU for baseline sample generation (low_vram mode)")
+            torch.cuda.empty_cache()
+            flush()
+            try:
+                self.model.transformer_1.to(self.device_torch)
+                torch.cuda.empty_cache()
+                flush()
+                self.print_and_status_update("Transformer_1 moved to GPU successfully for baseline samples")
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                    self.print_and_status_update("WARNING: OOM moving transformer_1 to GPU - keeping on CPU")
+                    # Keep on CPU, pipeline will handle offloading
+                else:
+                    raise
 
         # patch the condition embedder
         self.model.transformer_1.condition_embedder.forward = partial(
@@ -313,195 +313,252 @@ class Wan2214bModel(Wan21):
 
         self.print_and_status_update("Loading transformer 1")
         dtype = self.torch_dtype
-        
-        # For ROCm, synchronize before loading to catch any async errors
-        from toolkit.backend_utils import is_rocm_available, synchronize_gpu
-        is_rocm = is_rocm_available()
-        if is_rocm:
-            synchronize_gpu()
-        
         transformer_1 = WanTransformer3DModel.from_pretrained(
             transformer_path_1,
             subfolder=subfolder_1,
             torch_dtype=dtype,
-        )
-        # Convert dtype on CPU first to avoid ROCm issues
-        
-        if is_rocm:
-            # For ROCm, dtype conversion might be problematic
-            # The model is already loaded with torch_dtype, so it should be fine
-            # Only convert if really necessary
-            if transformer_1.dtype != dtype:
-                try:
-                    transformer_1 = transformer_1.to(dtype=dtype)
-                except (RuntimeError, Exception) as e:
-                    if "HIP" in str(e) or "hipError" in str(e):
-                        self.print_and_status_update(f"Warning: dtype conversion failed on ROCm, keeping original dtype: {e}")
-                        # Keep original dtype - it should still work
-                    else:
-                        raise
-        else:
-            try:
-                transformer_1 = transformer_1.to(dtype=dtype)
-            except RuntimeError as e:
-                if "HIP" in str(e) or "hipError" in str(e):
-                    self.print_and_status_update(f"Warning: dtype conversion failed, will convert after device transfer: {e}")
-                else:
-                    raise
+        ).to(dtype=dtype)
 
         flush()
 
-        if self.model_config.low_vram:
-            # quantize on the device
-            transformer_1.to('cpu', dtype=dtype)
-            flush()
-        else:
-            # Move to device with error handling for ROCm compatibility
-            from toolkit.backend_utils import is_rocm_available
-            is_rocm = is_rocm_available()
+        # Try to keep transformer_1 on GPU if we have enough memory
+        # Only move to CPU if low_vram mode is explicitly enabled AND we're tight on memory
+        transformer_1_was_on_gpu = False
+        try:
+            # Check available GPU memory
+            available_gb, total_gb, reserved_gb, allocated_gb = get_available_gpu_memory_gb()
+            self.print_and_status_update(f"GPU memory: {available_gb:.2f} GB available / {total_gb:.2f} GB total (reserved: {reserved_gb:.2f} GB, allocated: {allocated_gb:.2f} GB)")
             
-            if is_rocm:
-                # For ROCm, model loading to device can be problematic
-                # Keep model on CPU initially, let Accelerate handle device placement
-                self.print_and_status_update("ROCm detected: keeping transformer 1 on CPU (will be moved by Accelerate)")
-                # Ensure model is on CPU with correct dtype
-                transformer_1 = transformer_1.cpu()
-                if dtype != transformer_1.dtype:
-                    transformer_1 = transformer_1.to(dtype=dtype)
-                # Don't move to GPU here - let Accelerate.prepare() handle it
-                # This avoids HIP errors during initial load
+            # Estimate transformer size (roughly 20-25 GB unquantized, ~10-12 GB quantized)
+            estimated_transformer_gb = 12.0 if self.model_config.quantize else 22.0
+            
+            # Only use low_vram mode if explicitly enabled AND we don't have enough memory for both transformers
+            if self.model_config.low_vram and available_gb < (estimated_transformer_gb * 2.5):
+                self.print_and_status_update(f"Low VRAM mode: Only {available_gb:.2f} GB available, moving transformer_1 to CPU")
+                transformer_1.to('cpu', dtype=dtype)
+                flush()
             else:
-                # CUDA: normal transfer
+                # Try to keep on GPU - we have enough memory
+                self.print_and_status_update(f"Sufficient GPU memory ({available_gb:.2f} GB available), keeping transformer_1 on GPU")
                 try:
                     transformer_1.to(self.device_torch, dtype=dtype)
+                    transformer_1_was_on_gpu = True
+                    flush()
                 except RuntimeError as e:
-                    if "HIP" in str(e) or "hipError" in str(e):
-                        # Fallback to step-by-step
-                        self.print_and_status_update(f"Warning: Direct device transfer failed, trying step-by-step: {e}")
-                        transformer_1 = transformer_1.to('cpu')
+                    if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                        self.print_and_status_update("OOM moving transformer_1 to GPU, falling back to CPU")
+                        transformer_1.to('cpu', dtype=dtype)
+                        torch.cuda.empty_cache()
                         flush()
-                        transformer_1 = transformer_1.to(self.device_torch)
-                        if dtype != transformer_1.dtype:
-                            transformer_1 = transformer_1.to(dtype=dtype)
                     else:
                         raise
-            flush()
+        except Exception as e:
+            # Fallback: if we can't check memory, use low_vram setting
+            self.print_and_status_update(f"Could not check GPU memory: {e}, using low_vram setting")
+            if self.model_config.low_vram:
+                transformer_1.to('cpu', dtype=dtype)
+                flush()
+            else:
+                transformer_1.to(self.device_torch, dtype=dtype)
+                flush()
+                transformer_1_was_on_gpu = True
 
         if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None:
             # todo handle two ARAs
             self.print_and_status_update("Quantizing Transformer 1")
-            # Get training folder (set by BaseSDTrainProcess before load_model)
-            training_folder = getattr(self, 'training_folder', None)
-            quantize_model(self, transformer_1, model_path=transformer_path_1, model_name="transformer_1", training_folder=training_folder)
+            quantize_model(self, transformer_1)
             flush()
+            # Clear cache after quantization to free up fragmented memory
+            torch.cuda.empty_cache()
+            flush()
+            
+            # After quantization, transformer is smaller - try to move back to GPU if it was there
+            if transformer_1_was_on_gpu:
+                try:
+                    available_gb, _, _, _ = get_available_gpu_memory_gb()
+                    if available_gb > 6.0:  # Quantized transformer needs ~6 GB
+                        self.print_and_status_update(f"Moving quantized transformer_1 back to GPU ({available_gb:.2f} GB available)")
+                        transformer_1.to(self.device_torch)
+                        torch.cuda.empty_cache()
+                        flush()
+                        transformer_1_was_on_gpu = True
+                    else:
+                        self.print_and_status_update(f"Insufficient GPU memory ({available_gb:.2f} GB), keeping transformer_1 on CPU")
+                        transformer_1_was_on_gpu = False
+                except Exception:
+                    # If check fails, try anyway
+                    try:
+                        transformer_1.to(self.device_torch)
+                        transformer_1_was_on_gpu = True
+                    except:
+                        transformer_1_was_on_gpu = False
 
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer 1 to CPU")
+        # Only move transformer_1 to CPU before loading transformer_2 if it's actually on GPU
+        # This prevents unnecessary CPU->GPU->CPU transfers
+        if transformer_1_was_on_gpu:
+            self.print_and_status_update("Moving transformer 1 to CPU temporarily to free GPU memory before loading transformer 2")
             transformer_1.to("cpu")
-        else:
-            # For ROCm, keep on CPU - Accelerate will handle device placement
-            from toolkit.backend_utils import is_rocm_available
-            if is_rocm_available():
-                self.print_and_status_update("ROCm: keeping transformer 1 on CPU (Accelerate will handle device placement)")
-                transformer_1.to("cpu")
-            else:
-                transformer_1.to(self.device_torch)
+            # Aggressive cache clearing to reduce fragmentation
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # Ensure all operations complete
+            flush()
 
         self.print_and_status_update("Loading transformer 2")
         dtype = self.torch_dtype
         
-        # For ROCm, synchronize before loading to catch any async errors
-        from toolkit.backend_utils import is_rocm_available, synchronize_gpu
-        is_rocm = is_rocm_available()
-        if is_rocm:
-            synchronize_gpu()
+        # Aggressive cache clearing before loading second transformer to reduce fragmentation
+        # This is especially important for ROCm/HIP on newer architectures like gfx1151
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # Ensure all operations complete
+        flush()
         
         transformer_2 = WanTransformer3DModel.from_pretrained(
             transformer_path_2,
             subfolder=subfolder_2,
             torch_dtype=dtype,
-        )
-        # Convert dtype on CPU first to avoid ROCm issues
-        
-        if is_rocm:
-            # For ROCm, dtype conversion might be problematic
-            # The model is already loaded with torch_dtype, so it should be fine
-            # Only convert if really necessary
-            if transformer_2.dtype != dtype:
-                try:
-                    transformer_2 = transformer_2.to(dtype=dtype)
-                except (RuntimeError, Exception) as e:
-                    if "HIP" in str(e) or "hipError" in str(e):
-                        self.print_and_status_update(f"Warning: dtype conversion failed on ROCm, keeping original dtype: {e}")
-                        # Keep original dtype - it should still work
-                    else:
-                        raise
-        else:
-            try:
-                transformer_2 = transformer_2.to(dtype=dtype)
-            except RuntimeError as e:
-                if "HIP" in str(e) or "hipError" in str(e):
-                    self.print_and_status_update(f"Warning: dtype conversion failed, will convert after device transfer: {e}")
-                else:
-                    raise
+        ).to(dtype=dtype)
 
         flush()
+        
+        # Clear cache again before moving to device
+        torch.cuda.empty_cache()
+        flush()
 
-        if self.model_config.low_vram:
-            # quantize on the device
-            transformer_2.to('cpu', dtype=dtype)
-            flush()
-        else:
-            # Move to device with error handling for ROCm compatibility
-            from toolkit.backend_utils import is_rocm_available
-            is_rocm = is_rocm_available()
+        # Check available memory before deciding where to keep transformer_2
+        will_quantize = self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None
+        
+        try:
+            available_gb, total_gb, _, _ = get_available_gpu_memory_gb()
+            estimated_transformer_gb = 12.0 if will_quantize else 22.0
             
-            if is_rocm:
-                # For ROCm, model loading to device can be problematic
-                # Keep model on CPU initially, let Accelerate handle device placement
-                self.print_and_status_update("ROCm detected: keeping transformer 2 on CPU (will be moved by Accelerate)")
-                # Ensure model is on CPU with correct dtype
-                transformer_2 = transformer_2.cpu()
-                if dtype != transformer_2.dtype:
-                    transformer_2 = transformer_2.to(dtype=dtype)
-                # Don't move to GPU here - let Accelerate.prepare() handle it
-                # This avoids HIP errors during initial load
+            # Decide: GPU or CPU based on available memory
+            use_low_vram = self.model_config.low_vram and available_gb < (estimated_transformer_gb * 2.5)
+            
+            if use_low_vram:
+                self.print_and_status_update(f"Low VRAM mode: Only {available_gb:.2f} GB available, keeping transformer_2 on CPU")
+                transformer_2.to('cpu', dtype=dtype)
+                flush()
+            elif will_quantize:
+                # Quantization will be on CPU, so keep it there for now
+                self.print_and_status_update("Keeping transformer 2 on CPU for quantization")
+                transformer_2.to('cpu', dtype=dtype)
+                torch.cuda.empty_cache()
+                flush()
             else:
-                # CUDA: normal transfer
+                # Try GPU - we have enough memory
+                self.print_and_status_update(f"Moving transformer_2 to GPU ({available_gb:.2f} GB available)")
+                torch.cuda.empty_cache()
                 try:
                     transformer_2.to(self.device_torch, dtype=dtype)
+                    torch.cuda.empty_cache()
+                    flush()
                 except RuntimeError as e:
-                    if "HIP" in str(e) or "hipError" in str(e):
-                        # Fallback to step-by-step
-                        self.print_and_status_update(f"Warning: Direct device transfer failed, trying step-by-step: {e}")
-                        transformer_2 = transformer_2.to('cpu')
+                    if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                        self.print_and_status_update("OOM moving transformer_2 to GPU, keeping on CPU")
+                        transformer_2.to('cpu', dtype=dtype)
+                        torch.cuda.empty_cache()
                         flush()
-                        transformer_2 = transformer_2.to(self.device_torch)
-                        if dtype != transformer_2.dtype:
-                            transformer_2 = transformer_2.to(dtype=dtype)
                     else:
                         raise
-            flush()
+        except Exception:
+            # Fallback to original logic
+            if self.model_config.low_vram:
+                transformer_2.to('cpu', dtype=dtype)
+                flush()
+            elif will_quantize:
+                transformer_2.to('cpu', dtype=dtype)
+                torch.cuda.empty_cache()
+                flush()
+            else:
+                torch.cuda.empty_cache()
+                transformer_2.to(self.device_torch, dtype=dtype)
+                torch.cuda.empty_cache()
+                flush()
 
-        if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is None:
+        if will_quantize:
             # todo handle two ARAs
             self.print_and_status_update("Quantizing Transformer 2")
-            # Get training folder (set by BaseSDTrainProcess before load_model)
-            training_folder = getattr(self, 'training_folder', None)
-            quantize_model(self, transformer_2, model_path=transformer_path_2, model_name="transformer_2", training_folder=training_folder)
+            quantize_model(self, transformer_2)
+            flush()
+            # Clear cache after quantization
+            torch.cuda.empty_cache()
             flush()
 
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer 2 to CPU")
-            transformer_2.to("cpu")
-        else:
-            # For ROCm, keep on CPU - Accelerate will handle device placement
-            from toolkit.backend_utils import is_rocm_available
-            if is_rocm_available():
-                self.print_and_status_update("ROCm: keeping transformer 2 on CPU (Accelerate will handle device placement)")
-                transformer_2.to("cpu")
+        # After quantization, try to move transformers to GPU if we have enough memory
+        # Check available memory and decide dynamically
+        try:
+            available_gb, total_gb, _, _ = get_available_gpu_memory_gb()
+            # Quantized transformers need ~6-7 GB each
+            estimated_per_transformer_gb = 6.5 if will_quantize else 22.0
+            needed_gb = estimated_per_transformer_gb * 2  # Both transformers
+            
+            # Check if transformer_2 is already on GPU
+            transformer_2_on_gpu = str(transformer_2.device).startswith('cuda')
+            
+            if not transformer_2_on_gpu and available_gb > needed_gb:
+                # Move transformer_2 to GPU (it's quantized, so smaller)
+                self.print_and_status_update(f"Moving transformer_2 to GPU ({available_gb:.2f} GB available, need ~{needed_gb:.2f} GB)")
+                torch.cuda.empty_cache()
+                flush()
+                try:
+                    transformer_2.to(self.device_torch)
+                    torch.cuda.empty_cache()
+                    flush()
+                    self.print_and_status_update("Transformer 2 moved to GPU successfully")
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                        self.print_and_status_update("OOM moving transformer_2 to GPU, keeping on CPU")
+                        transformer_2.to("cpu")
+                        torch.cuda.empty_cache()
+                        flush()
+                    else:
+                        raise
+            elif transformer_2_on_gpu:
+                self.print_and_status_update("Transformer 2 already on GPU")
             else:
-                transformer_2.to(self.device_torch)
+                self.print_and_status_update(f"Insufficient GPU memory ({available_gb:.2f} GB available, need ~{needed_gb:.2f} GB), keeping transformer_2 on CPU")
+            
+            # Now restore transformer_1 to GPU if it was there originally
+            if transformer_1_was_on_gpu:
+                available_gb, _, _, _ = get_available_gpu_memory_gb()
+                if available_gb > estimated_per_transformer_gb:
+                    self.print_and_status_update(f"Restoring transformer_1 to GPU ({available_gb:.2f} GB available)")
+                    torch.cuda.empty_cache()
+                    flush()
+                    try:
+                        transformer_1.to(self.device_torch)
+                        torch.cuda.empty_cache()
+                        flush()
+                        self.print_and_status_update("Transformer 1 restored to GPU successfully")
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                            self.print_and_status_update("OOM restoring transformer_1 - keeping on CPU")
+                            transformer_1_was_on_gpu = False
+                            torch.cuda.empty_cache()
+                            flush()
+                        else:
+                            raise
+                else:
+                    self.print_and_status_update(f"Insufficient GPU memory ({available_gb:.2f} GB available), keeping transformer_1 on CPU")
+                    transformer_1_was_on_gpu = False
+        except Exception as e:
+            # Fallback to original conservative logic
+            self.print_and_status_update(f"Could not check memory for restoration: {e}, using conservative approach")
+            if self.model_config.low_vram:
+                transformer_2.to("cpu")
+                transformer_1_was_on_gpu = False
+            else:
+                # Try to move both, but be conservative
+                try:
+                    transformer_2.to(self.device_torch)
+                    if transformer_1_was_on_gpu:
+                        transformer_1.to(self.device_torch)
+                except:
+                    pass
     
         layer_offloading_transformer = self.model_config.layer_offloading and self.model_config.layer_offloading_transformer_percent > 0
         # make the combined model

@@ -42,8 +42,7 @@ from torchvision.transforms import functional as TF
 
 
 def flush():
-    from toolkit.backend_utils import clear_gpu_cache
-    clear_gpu_cache()
+    torch.cuda.empty_cache()
     gc.collect()
 
 
@@ -244,75 +243,195 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.requires_grad_(False)
 
     def hook_before_train_loop(self):
+        print("SDTrainer.hook_before_train_loop() starting...")
         super().hook_before_train_loop()
+        print("Base hook_before_train_loop() completed")
+        
         if self.is_caching_text_embeddings:
+            print("Caching text embeddings - moving unet to CPU...")
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
+            print("Unet moved to CPU")
         
         # cache unconditional embeds (blank prompt)
+        print("Caching unconditional embeddings...")
+        
+        # Clear cache before encoding to ensure we have memory available
+        # This is critical for ROCm/gfx1151 where memory allocation can hang
+        import gc
+        import os
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print("  Cache cleared before encoding")
+        
+        # Check memory state before encoding
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            total_mem = torch.cuda.get_device_properties(device).total_memory / 1024**3
+            reserved_mem = torch.cuda.memory_reserved(device) / 1024**3
+            allocated_mem = torch.cuda.memory_allocated(device) / 1024**3
+            free_mem = total_mem - reserved_mem
+            print(f"  Memory before encoding: {free_mem:.2f} GB free / {total_mem:.2f} GB total (allocated: {allocated_mem:.2f} GB, reserved: {reserved_mem:.2f} GB)")
+        
         with torch.no_grad():
             kwargs = {}
             if self.sd.encode_control_in_text_embeddings:
+                print("  Creating control image tensor...")
                 # just do a blank image for unconditionals
                 control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
                 if self.sd.has_multiple_control_images:
                     control_image = [control_image]
                 
                 kwargs['control_images'] = control_image
-            self.unconditional_embeds = self.sd.encode_prompt(
-                [self.train_config.unconditional_prompt],
-                long_prompts=self.do_long_prompts,
-                **kwargs
-            ).to(
-                self.device_torch,
-                dtype=self.sd.torch_dtype
-            ).detach()
+                print("  Control image created")
+            
+            print("  Encoding prompt (this may take a moment on ROCm)...")
+            try:
+                # Check text encoder location - for Wan22, it's in pipeline.text_encoder
+                text_encoder_to_move = None
+                text_encoder_location = None
+                
+                # First check if it's in pipeline (Wan22 models)
+                if hasattr(self.sd, 'pipeline') and hasattr(self.sd.pipeline, 'text_encoder'):
+                    text_encoder_to_move = self.sd.pipeline.text_encoder
+                    if hasattr(text_encoder_to_move, 'device'):
+                        text_encoder_location = text_encoder_to_move.device
+                    elif len(list(text_encoder_to_move.parameters())) > 0:
+                        text_encoder_location = next(text_encoder_to_move.parameters()).device
+                    else:
+                        text_encoder_location = torch.device('cpu')
+                    print(f"  Found text encoder in pipeline at: {text_encoder_location}")
+                
+                # Also check sd.text_encoder (for other models)
+                if text_encoder_to_move is None and hasattr(self.sd, 'text_encoder') and self.sd.text_encoder is not None:
+                    if isinstance(self.sd.text_encoder, list):
+                        text_encoder_to_move = self.sd.text_encoder[0]  # Use first one
+                        if len(list(text_encoder_to_move.parameters())) > 0:
+                            text_encoder_location = next(text_encoder_to_move.parameters()).device
+                        else:
+                            text_encoder_location = torch.device('cpu')
+                    else:
+                        text_encoder_to_move = self.sd.text_encoder
+                        if len(list(text_encoder_to_move.parameters())) > 0:
+                            text_encoder_location = next(text_encoder_to_move.parameters()).device
+                        else:
+                            text_encoder_location = torch.device('cpu')
+                    print(f"  Found text encoder in sd.text_encoder at: {text_encoder_location}")
+                
+                # Move text encoder if needed
+                # NOTE: For Wan22 models, get_prompt_embeds() will also try to move the text encoder
+                # So we skip the move here and let encode_prompt -> get_prompt_embeds handle it
+                # This avoids doing the move twice, but get_prompt_embeds will still hang if moving is needed
+                if text_encoder_to_move is not None and text_encoder_location != self.device_torch:
+                    print(f"  Text encoder is on {text_encoder_location}, needs to be on {self.device_torch}")
+                    print(f"  WARNING: Skipping move here - encode_prompt will handle it via get_prompt_embeds()")
+                    print(f"  WARNING: The move in get_prompt_embeds() may hang on ROCm with PYTORCH_NO_HIP_MEMORY_CACHING=1")
+                    print(f"  This is a known ROCm issue with large model moves when caching allocator is disabled")
+                elif text_encoder_to_move is not None:
+                    print(f"  Text encoder already on correct device: {text_encoder_location}")
+                else:
+                    print(f"  WARNING: Could not find text encoder - encode_prompt will handle device placement")
+                
+                print("  Calling sd.encode_prompt()...")
+                print(f"  Prompt: {self.train_config.unconditional_prompt[:50]}...")
+                
+                # Clear cache one more time before encoding
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                
+                # Check memory one more time
+                if torch.cuda.is_available():
+                    device = torch.cuda.current_device()
+                    total_mem = torch.cuda.get_device_properties(device).total_memory / 1024**3
+                    reserved_mem = torch.cuda.memory_reserved(device) / 1024**3
+                    allocated_mem = torch.cuda.memory_allocated(device) / 1024**3
+                    free_mem = total_mem - reserved_mem
+                    print(f"  Memory before encode_prompt: {free_mem:.2f} GB free (allocated: {allocated_mem:.2f} GB, reserved: {reserved_mem:.2f} GB)")
+                
+                print("  Starting encode_prompt call - this may hang on ROCm during text encoder forward pass...")
+                try:
+                    self.unconditional_embeds = self.sd.encode_prompt(
+                        [self.train_config.unconditional_prompt],
+                        long_prompts=self.do_long_prompts,
+                        **kwargs
+                    ).to(
+                        self.device_torch,
+                        dtype=self.sd.torch_dtype
+                    ).detach()
+                    print("  Unconditional embeddings cached successfully")
+                    print(f"  Embeddings shape: {self.unconditional_embeds.text_embeds.shape if hasattr(self.unconditional_embeds, 'text_embeds') else 'N/A'}")
+                except Exception as e:
+                    print(f"  ERROR during encode_prompt: {type(e).__name__}: {e}")
+                    import traceback
+                    print(f"  Traceback:\n{traceback.format_exc()}")
+                    raise
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                    print(f"  ERROR: OOM during prompt encoding: {e}")
+                    print("  Attempting aggressive memory cleanup...")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    # Try one more time
+                    print("  Retrying prompt encoding...")
+                    self.unconditional_embeds = self.sd.encode_prompt(
+                        [self.train_config.unconditional_prompt],
+                        long_prompts=self.do_long_prompts,
+                        **kwargs
+                    ).to(
+                        self.device_torch,
+                        dtype=self.sd.torch_dtype
+                    ).detach()
+                    print("  Unconditional embeddings cached on retry")
+                else:
+                    raise
         
         if self.train_config.do_prior_divergence:
             self.do_prior_prediction = True
+            print("Prior divergence enabled")
+        
         # move vae to device if we did not cache latents
+        print("Handling VAE device placement...")
         if not self.is_latents_cached:
+            print("  Moving VAE to device (latents not cached)...")
             self.sd.vae.eval()
-            # For ROCm, handle VAE device transfer with error handling
-            try:
-                from toolkit.backend_utils import is_rocm_available, synchronize_gpu
-                is_rocm = is_rocm_available()
-            except ImportError:
-                is_rocm = False
-            
-            if is_rocm:
-                synchronize_gpu()
-                try:
-                    self.sd.vae.to(self.device_torch)
-                    synchronize_gpu()
-                except (RuntimeError, Exception) as e:
-                    error_str = str(e)
-                    if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in type(e).__name__:
-                        # Keep VAE on CPU if device transfer fails
-                        # It will be used on CPU during encode/decode operations
-                        pass
-                    else:
-                        raise
-            else:
-                self.sd.vae.to(self.device_torch)
+            self.sd.vae.to(self.device_torch)
+            print("  VAE moved to device")
         else:
+            print("  Moving VAE to CPU (latents already cached)...")
             # offload it. Already cached
             self.sd.vae.to('cpu')
             flush()
+            print("  VAE moved to CPU")
+        
+        print("Adding SNR values to noise scheduler...")
         add_all_snr_to_noise_scheduler(self.sd.noise_scheduler, self.device_torch)
+        print("SNR values added to scheduler")
+        
         if self.adapter is not None:
+            print("Moving adapter to device...")
             self.adapter.to(self.device_torch)
-
-            # check if we have regs and using adapter and caching clip embeddings
+            print("Adapter moved to device")
+        
+        print("SDTrainer.hook_before_train_loop() completed")
+        
+        # check if we have regs and using adapter and caching clip embeddings
+        if self.adapter is not None:
+            print("Checking for regularization datasets and clip embedding caching...")
             has_reg = self.datasets_reg is not None and len(self.datasets_reg) > 0
             is_caching_clip_embeddings = self.datasets is not None and any([self.datasets[i].cache_clip_vision_to_disk for i in range(len(self.datasets))])
 
             if has_reg and is_caching_clip_embeddings:
+                print("  Loading unconditional clip image embeds from datasets...")
                 # we need a list of unconditional clip image embeds from other datasets to handle regs
                 unconditional_clip_image_embeds = []
                 datasets = get_dataloader_datasets(self.data_loader)
+                print(f"  Found {len(datasets)} datasets")
                 for i in range(len(datasets)):
                     unconditional_clip_image_embeds += datasets[i].clip_vision_unconditional_cache
+                print("  Unconditional clip image embeds loaded")
 
                 if len(unconditional_clip_image_embeds) == 0:
                     raise ValueError("No unconditional clip image embeds found. This should not happen")
@@ -2076,8 +2195,7 @@ class SDTrainer(BaseSDTrainProcess):
             else:
                 total_loss += loss
             if len(batch_list) > 1 and self.model_config.low_vram:
-                from toolkit.backend_utils import clear_gpu_cache
-                clear_gpu_cache()
+                torch.cuda.empty_cache()
 
 
         if not self.is_grad_accumulation_step:

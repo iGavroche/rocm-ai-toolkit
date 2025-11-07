@@ -29,8 +29,7 @@ Module = Union['LoConSpecialModule', 'LoRAModule', 'DoRAModule']
 LINEAR_MODULES = [
     'Linear',
     'LoRACompatibleLinear',
-    'QLinear',
-    'Linear8bitLt',  # bitsandbytes 8-bit Linear
+    'QLinear'
     # 'GroupNorm',
 ]
 CONV_MODULES = [
@@ -766,51 +765,90 @@ class ToolkitNetworkMixin:
         self.is_active = False
 
     def force_to(self: Network, device, dtype):
-        # For ROCm, handle device transfers carefully
-        try:
-            from toolkit.backend_utils import is_rocm_available, synchronize_gpu
-            is_rocm = is_rocm_available()
-        except ImportError:
-            is_rocm = False
-        
-        if is_rocm:
-            synchronize_gpu()
-            try:
-                # Step-by-step device transfer for ROCm
-                self.to("cpu")  # Ensure on CPU first
-                self.to(device)
-                self.to(dtype=dtype)
-            except (RuntimeError, Exception) as e:
-                if "HIP" in str(e) or "hipError" in str(e):
-                    # Keep on CPU if HIP error
-                    self.to("cpu")
-                else:
-                    raise
-        else:
-            self.to(device, dtype)
-        
+        self.to(device, dtype)
         loras = []
         if hasattr(self, 'unet_loras'):
             loras += self.unet_loras
         if hasattr(self, 'text_encoder_loras'):
             loras += self.text_encoder_loras
         
-        for lora in loras:
-            if is_rocm:
-                synchronize_gpu()
+        # Move LoRAs one at a time with cache clearing between moves to reduce fragmentation
+        import gc
+        import torch
+        
+        # Memory defragmentation strategy: Try to consolidate memory before moving LoRAs
+        # This helps reduce fragmentation by forcing the allocator to reorganize
+        def attempt_memory_defrag():
+            """Attempt to defragment GPU memory by allocating/freeing blocks"""
+            try:
+                if torch.cuda.is_available():
+                    # Allocate a large block to force allocator reorganization
+                    # Then free it to create contiguous space
+                    block_size = 1024 * 1024 * 128  # 128MB block
+                    try:
+                        temp_block = torch.zeros(block_size, device=device, dtype=torch.float32)
+                        del temp_block
+                        torch.cuda.synchronize()
+                    except RuntimeError:
+                        # If we can't allocate, skip defragmentation
+                        pass
+            except Exception:
+                # Non-critical, continue anyway
+                pass
+        
+        failed_loras = []
+        for i, lora in enumerate(loras):
+            try:
+                # Attempt defragmentation every 20 LoRAs if we're having issues
+                if i > 0 and i % 20 == 0:
+                    attempt_memory_defrag()
+                
+                lora.to(device, dtype)
+                # Clear cache every 10 LoRAs to prevent fragmentation buildup
+                if (i + 1) % 10 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                    # Clear cache and try again once
+                    print(f"OOM moving LoRA {i+1}/{len(loras)}, clearing cache and retrying...")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    try:
+                        lora.to(device, dtype)
+                    except RuntimeError as e2:
+                        if "out of memory" in str(e2).lower() or "hip" in str(e2).lower():
+                            # Failed even after retry - keep on CPU for now
+                            print(f"WARNING: Failed to move LoRA {i+1}/{len(loras)} to GPU after retry - keeping on CPU")
+                            failed_loras.append((i, lora))
+                            # Try to move back to CPU to avoid partial state
+                            try:
+                                lora.to("cpu", dtype)
+                            except:
+                                pass
+                        else:
+                            raise
+                else:
+                    raise
+        
+        # If we have failed LoRAs, try to move them one more time after all others are done
+        if failed_loras:
+            print(f"Attempting to move {len(failed_loras)} failed LoRAs to GPU after clearing cache...")
+            # Aggressive memory cleanup and defragmentation before retry
+            attempt_memory_defrag()
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            for idx, lora in failed_loras:
                 try:
-                    # Step-by-step device transfer for ROCm
-                    lora.to("cpu")  # Ensure on CPU first
-                    lora.to(device)
-                    lora.to(dtype=dtype)
-                except (RuntimeError, Exception) as e:
-                    if "HIP" in str(e) or "hipError" in str(e):
-                        # Keep on CPU if HIP error
-                        lora.to("cpu")
+                    lora.to(device, dtype)
+                    print(f"Successfully moved LoRA {idx+1} to GPU on retry")
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                        print(f"CRITICAL: LoRA {idx+1} still cannot be moved to GPU - will remain on CPU (may cause issues)")
                     else:
                         raise
-            else:
-                lora.to(device, dtype)
 
     def get_all_modules(self: Network) -> List[Module]:
         loras = []

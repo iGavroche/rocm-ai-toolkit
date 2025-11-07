@@ -74,8 +74,7 @@ from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
 
 def flush():
-    from toolkit.backend_utils import clear_gpu_cache
-    clear_gpu_cache()
+    torch.cuda.empty_cache()
     gc.collect()
 
 
@@ -713,82 +712,228 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set some config
         self.accelerator.even_batches=False
         
-        # Import safe_prepare for ROCm compatibility
-        from toolkit.accelerator import safe_prepare
+        # Aggressive memory cleanup and defragmentation before preparing models
+        # This is critical for ROCm/gfx1151 where fragmentation can prevent small allocations
+        # even when large amounts of memory appear "free"
+        print("Preparing accelerator - performing aggressive memory cleanup...")
         
-        # For ROCm, ensure models are on CPU before prepare
-        from toolkit.backend_utils import is_rocm_available, synchronize_gpu
-        is_rocm = is_rocm_available()
+        # Check memory state before cleanup
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            total_mem = torch.cuda.get_device_properties(device).total_memory / 1024**3
+            reserved_mem = torch.cuda.memory_reserved(device) / 1024**3
+            allocated_mem = torch.cuda.memory_allocated(device) / 1024**3
+            free_mem = total_mem - reserved_mem
+            print(f"Memory before accelerator prepare: {free_mem:.2f} GB free / {total_mem:.2f} GB total (allocated: {allocated_mem:.2f} GB, reserved: {reserved_mem:.2f} GB)")
         
-        if is_rocm:
-            synchronize_gpu()
-            # Ensure VAE is on CPU
-            if hasattr(self.sd, 'vae') and self.sd.vae is not None:
+        # Attempt memory defragmentation by allocating/freeing blocks
+        def attempt_memory_defrag():
+            """Attempt to defragment GPU memory"""
+            try:
+                if torch.cuda.is_available():
+                    # Try to allocate several blocks to force allocator reorganization
+                    blocks = []
+                    block_size = 1024 * 1024 * 128  # 128MB blocks
+                    for i in range(4):  # Try 4 blocks = 512MB total
+                        try:
+                            block = torch.zeros(block_size, device=self.device_torch, dtype=torch.float32)
+                            blocks.append(block)
+                        except RuntimeError:
+                            # Can't allocate more, that's okay
+                            break
+                    
+                    # Free all blocks immediately to create contiguous space
+                    for block in blocks:
+                        del block
+                    del blocks
+                    torch.cuda.synchronize()
+            except Exception:
+                # Non-critical, continue anyway
+                pass
+        
+        # Perform aggressive cleanup
+        attempt_memory_defrag()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        # For Wan22 models with dual transformers, temporarily offload transformer_2
+        # to free a large contiguous block before preparing the VAE
+        # Offload both transformers to CPU to maximize free contiguous memory
+        transformer_1_was_offloaded = False
+        transformer_2_was_offloaded = False
+        if hasattr(self.sd, 'model'):
+            # Offload transformer_1 if present
+            if hasattr(self.sd.model, 'transformer_1'):
                 try:
-                    self.sd.vae.to("cpu")
-                except (RuntimeError, Exception):
-                    pass  # Already on CPU or error handled
+                    if self.sd.model.transformer_1 is not None:
+                        next_param = next(self.sd.model.transformer_1.parameters(), None)
+                        if next_param is not None and next_param.device.type == 'cuda':
+                            print("Temporarily offloading transformer_1 to CPU before preparing VAE...")
+                            self.sd.model.transformer_1.to('cpu')
+                            transformer_1_was_offloaded = True
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                except Exception as e:
+                    print(f"Could not offload transformer_1: {e}")
+            
+            # Offload transformer_2 if present
+            if hasattr(self.sd.model, 'transformer_2'):
+                try:
+                    if self.sd.model.transformer_2 is not None:
+                        # Check if transformer_2 is on GPU
+                        next_param = next(self.sd.model.transformer_2.parameters(), None)
+                        if next_param is not None and next_param.device.type == 'cuda':
+                            print("Temporarily offloading transformer_2 to CPU before preparing VAE...")
+                            self.sd.model.transformer_2.to('cpu')
+                            transformer_2_was_offloaded = True
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                except Exception as e:
+                    print(f"Could not offload transformer_2: {e}")
+        
+        # Final aggressive cleanup after offloading transformers
+        if transformer_1_was_offloaded or transformer_2_was_offloaded:
+            print("Performing final memory cleanup after transformer offload...")
+            attempt_memory_defrag()
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            # Check memory after offloading
+            if torch.cuda.is_available():
+                device = torch.cuda.current_device()
+                total_mem = torch.cuda.get_device_properties(device).total_memory / 1024**3
+                reserved_mem = torch.cuda.memory_reserved(device) / 1024**3
+                allocated_mem = torch.cuda.memory_allocated(device) / 1024**3
+                free_mem = total_mem - reserved_mem
+                print(f"Memory after transformer offload: {free_mem:.2f} GB free / {total_mem:.2f} GB total (allocated: {allocated_mem:.2f} GB, reserved: {reserved_mem:.2f} GB)")
         
         # # prepare all the models stuff for accelerator (hopefully we dont miss any)
-        self.sd.vae = safe_prepare(self.accelerator, self.sd.vae)
-        if self.sd.unet is not None:
-            if is_rocm:
+        # CRITICAL FIX for ROCm/gfx1151 fragmentation:
+        # Move VAE to CPU before preparing to avoid fragmentation during parameter-by-parameter move
+        # This forces PyTorch to release reserved memory blocks before the accelerator moves it back
+        vae_was_on_cpu = False
+        try:
+            # Check if VAE is on GPU
+            if hasattr(self.sd.vae, 'parameters'):
+                next_param = next(self.sd.vae.parameters(), None)
+                if next_param is not None and next_param.device.type == 'cuda':
+                    print("Moving VAE to CPU before accelerator.prepare() to avoid fragmentation...")
+                    self.sd.vae.to('cpu')
+                    vae_was_on_cpu = True
+                    # Force release of reserved memory by clearing cache after moving to CPU
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    
+                    # Check memory after moving VAE to CPU
+                    if torch.cuda.is_available():
+                        device = torch.cuda.current_device()
+                        total_mem = torch.cuda.get_device_properties(device).total_memory / 1024**3
+                        reserved_mem = torch.cuda.memory_reserved(device) / 1024**3
+                        allocated_mem = torch.cuda.memory_allocated(device) / 1024**3
+                        free_mem = total_mem - reserved_mem
+                        print(f"Memory after VAE moved to CPU: {free_mem:.2f} GB free / {total_mem:.2f} GB total (allocated: {allocated_mem:.2f} GB, reserved: {reserved_mem:.2f} GB)")
+        except Exception as e:
+            print(f"Could not move VAE to CPU before prepare: {e}")
+        
+        try:
+            # Now prepare the VAE - accelerator will move it back to GPU as a whole unit
+            # This avoids the parameter-by-parameter fragmentation issue
+            self.sd.vae = self.accelerator.prepare(self.sd.vae)
+            
+            # Restore transformers after VAE is prepared
+            if transformer_1_was_offloaded:
                 try:
-                    self.sd.unet.to("cpu")
-                except (RuntimeError, Exception):
-                    pass
-            self.sd.unet = safe_prepare(self.accelerator, self.sd.unet)
+                    print("Restoring transformer_1 to GPU after VAE preparation...")
+                    self.sd.model.transformer_1.to(self.device_torch)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    print("  transformer_1 restored to GPU successfully")
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                        print(f"  WARNING: OOM restoring transformer_1 to GPU - keeping on CPU (will use low_vram mode)")
+                    else:
+                        raise
+            
+            if transformer_2_was_offloaded:
+                try:
+                    print("Restoring transformer_2 to GPU after VAE preparation...")
+                    self.sd.model.transformer_2.to(self.device_torch)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    print("  transformer_2 restored to GPU successfully")
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                        print(f"  WARNING: OOM restoring transformer_2 to GPU - keeping on CPU (will use low_vram mode)")
+                    else:
+                        raise
+                        
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                # One more aggressive cleanup attempt
+                print("OOM preparing VAE, attempting final memory cleanup...")
+                attempt_memory_defrag()
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                # Try again
+                self.sd.vae = self.accelerator.prepare(self.sd.vae)
+                
+                # Try to restore transformers even after retry
+                if transformer_1_was_offloaded:
+                    try:
+                        self.sd.model.transformer_1.to(self.device_torch)
+                        print("  transformer_1 restored to GPU after retry")
+                    except:
+                        print(f"  WARNING: OOM restoring transformer_1 to GPU - keeping on CPU")
+                if transformer_2_was_offloaded:
+                    try:
+                        self.sd.model.transformer_2.to(self.device_torch)
+                        print("  transformer_2 restored to GPU after retry")
+                    except:
+                        print(f"  WARNING: OOM restoring transformer_2 to GPU - keeping on CPU")
+            else:
+                raise
+        if self.sd.unet is not None:
+            self.sd.unet = self.accelerator.prepare(self.sd.unet)
             # todo always tdo it?
             self.modules_being_trained.append(self.sd.unet)
         if self.sd.text_encoder is not None and self.train_config.train_text_encoder:
             if isinstance(self.sd.text_encoder, list):
-                if is_rocm:
-                    for te in self.sd.text_encoder:
-                        try:
-                            te.to("cpu")
-                        except (RuntimeError, Exception):
-                            pass
-                self.sd.text_encoder = [safe_prepare(self.accelerator, model) for model in self.sd.text_encoder]
+                self.sd.text_encoder = [self.accelerator.prepare(model) for model in self.sd.text_encoder]
                 self.modules_being_trained.extend(self.sd.text_encoder)
             else:
-                if is_rocm:
-                    try:
-                        self.sd.text_encoder.to("cpu")
-                    except (RuntimeError, Exception):
-                        pass
-                self.sd.text_encoder = safe_prepare(self.accelerator, self.sd.text_encoder)
+                self.sd.text_encoder = self.accelerator.prepare(self.sd.text_encoder)
                 self.modules_being_trained.append(self.sd.text_encoder)
         if self.sd.refiner_unet is not None and self.train_config.train_refiner:
-            if is_rocm:
-                try:
-                    self.sd.refiner_unet.to("cpu")
-                except (RuntimeError, Exception):
-                    pass
-            self.sd.refiner_unet = safe_prepare(self.accelerator, self.sd.refiner_unet)
+            self.sd.refiner_unet = self.accelerator.prepare(self.sd.refiner_unet)
             self.modules_being_trained.append(self.sd.refiner_unet)
         # todo, do we need to do the network or will "unet" get it?
         if self.sd.network is not None:
-            if is_rocm:
-                try:
-                    self.sd.network.to("cpu")
-                except (RuntimeError, Exception):
-                    pass
-            self.sd.network = safe_prepare(self.accelerator, self.sd.network)
+            self.sd.network = self.accelerator.prepare(self.sd.network)
             self.modules_being_trained.append(self.sd.network)
         if self.adapter is not None and self.adapter_config.train:
             # todo adapters may not be a module. need to check
-            if is_rocm:
-                try:
-                    self.adapter.to("cpu")
-                except (RuntimeError, Exception):
-                    pass
-            self.adapter = safe_prepare(self.accelerator, self.adapter)
+            self.adapter = self.accelerator.prepare(self.adapter)
             self.modules_being_trained.append(self.adapter)
         
-        # prepare other things (optimizers and schedulers don't need device placement)
+        # Note: Transformers are restored above in the VAE preparation try/except block (lines 848-875)
+        
+        # prepare other things
+        print("Preparing optimizer...")
         self.optimizer = self.accelerator.prepare(self.optimizer)
+        print("Optimizer prepared")
         if self.lr_scheduler is not None:
+            print("Preparing learning rate scheduler...")
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
+            print("Learning rate scheduler prepared")
+        print("Accelerator preparation complete")
         # self.data_loader = self.accelerator.prepare(self.data_loader)
         # if self.data_loader_reg is not None:
         #     self.data_loader_reg = self.accelerator.prepare(self.data_loader_reg)
@@ -818,6 +963,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             )
 
     def before_dataset_load(self):
+        print("Starting dataset loading...")
         pass
 
     def get_params(self):
@@ -1552,28 +1698,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.sd.adapter = self.adapter
 
     def run(self):
-        print("[DEBUG] BaseSDTrainProcess.run() - starting")
-        import sys
-        sys.stdout.flush()
-        
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
-        print("[DEBUG] BaseSDTrainProcess.run() - calling BaseTrainProcess.run()")
-        sys.stdout.flush()
         BaseTrainProcess.run(self)
-        
-        print("[DEBUG] BaseSDTrainProcess.run() - BaseTrainProcess.run() completed")
-        sys.stdout.flush()
-        
         params = []
 
         ### HOOK ###
-        print("[DEBUG] BaseSDTrainProcess.run() - calling hook_before_model_load()")
-        sys.stdout.flush()
         self.hook_before_model_load()
-        
-        print("[DEBUG] BaseSDTrainProcess.run() - copying model_config")
-        sys.stdout.flush()
         model_config_to_load = copy.deepcopy(self.model_config)
 
         if self.is_fine_tuning:
@@ -1586,17 +1717,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 model_config_to_load.name_or_path = latest_save_path
                 self.load_training_state_from_metadata(latest_save_path)
 
-        print("[DEBUG] BaseSDTrainProcess.run() - getting model class")
-        import sys
-        sys.stdout.flush()
         ModelClass = get_model_class(self.model_config)
-        print(f"[DEBUG] BaseSDTrainProcess.run() - ModelClass: {ModelClass}")
-        sys.stdout.flush()
-        
         # if the model class has get_train_scheduler static method
         if hasattr(ModelClass, 'get_train_scheduler'):
-            print("[DEBUG] BaseSDTrainProcess.run() - getting train scheduler from ModelClass")
-            sys.stdout.flush()
             sampler = ModelClass.get_train_scheduler()
         else:
             # get the noise scheduler
@@ -1615,42 +1738,40 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 arch=arch,
             )
 
+        print_acc(f"Loading model: {self.model_config.name_or_path}")
+        print_acc(f"Model architecture: {self.model_config.arch if hasattr(self.model_config, 'arch') else 'auto-detect'}")
+        print_acc("Note: Models are automatically downloaded from HuggingFace if not already cached.")
+        print_acc("Large models may take several minutes to download on first run.")
+        
         if self.train_config.train_refiner and self.model_config.refiner_name_or_path is not None and self.network_config is None:
             previous_refiner_save = self.get_latest_save_path(self.job.name + '_refiner')
             if previous_refiner_save is not None:
                 model_config_to_load.refiner_name_or_path = previous_refiner_save
                 self.load_training_state_from_metadata(previous_refiner_save)
 
-        print("[DEBUG] BaseSDTrainProcess.run() - creating ModelClass instance")
-        import sys
-        sys.stdout.flush()
-        self.sd = ModelClass(
-            # todo handle single gpu and multi gpu here
-            # device=self.device,
-            device=self.accelerator.device,
-            model_config=model_config_to_load,
-            dtype=self.train_config.dtype,
-            custom_pipeline=self.custom_pipeline,
-            noise_scheduler=sampler,
-        )
-        print("[DEBUG] BaseSDTrainProcess.run() - ModelClass instance created")
-        sys.stdout.flush()
+        try:
+            self.sd = ModelClass(
+                # todo handle single gpu and multi gpu here
+                # device=self.device,
+                device=self.accelerator.device,
+                model_config=model_config_to_load,
+                dtype=self.train_config.dtype,
+                custom_pipeline=self.custom_pipeline,
+                noise_scheduler=sampler,
+            )
+            print_acc("Model loaded successfully!")
+        except Exception as e:
+            print_acc(f"ERROR loading model: {e}")
+            print_acc(f"This could be due to:")
+            print_acc(f"  - Model download failure (check network connection)")
+            print_acc(f"  - Insufficient disk space in HuggingFace cache")
+            print_acc(f"  - Invalid model path or model not found")
+            print_acc(f"  - Missing HuggingFace token for gated models")
+            raise
         
-        print("[DEBUG] BaseSDTrainProcess.run() - calling hook_after_sd_init_before_load()")
-        sys.stdout.flush()
         self.hook_after_sd_init_before_load()
-        
-        # Store save_root (job-specific folder) on model for quantization caching (before load_model so it's available during quantization)
-        # The model (self.sd) will use this during quantization
-        # Use save_root instead of training_folder so cache is job-specific
-        self.sd.training_folder = self.save_root
-        
-        print("[DEBUG] BaseSDTrainProcess.run() - calling sd.load_model()")
-        sys.stdout.flush()
         # run base sd process run
         self.sd.load_model()
-        print("[DEBUG] BaseSDTrainProcess.run() - sd.load_model() completed")
-        sys.stdout.flush()
         
         # compile the model if needed
         if self.model_config.compile:
@@ -1693,19 +1814,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if hasattr(text_encoder, 'set_attention_backend'):
                     text_encoder.set_attention_backend(self.train_config.attention_backend)
         if self.train_config.sdp:
-            from toolkit.backend_utils import is_cuda_available
-            # SDP backends - conditionally enable based on backend support
-            # ROCm may not support all CUDA SDP backends
-            if is_cuda_available():
-                torch.backends.cuda.enable_math_sdp(True)
-                torch.backends.cuda.enable_flash_sdp(True)
-                torch.backends.cuda.enable_mem_efficient_sdp(True)
-            else:
-                # For ROCm, only enable math SDP if available
-                try:
-                    torch.backends.cuda.enable_math_sdp(True)
-                except AttributeError:
-                    pass  # ROCm may not support all SDP backends
+            torch.backends.cuda.enable_math_sdp(True)
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
         
         # # check if we have sage and is flux
         # if self.sd.is_flux:
@@ -1843,9 +1954,78 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     **network_kwargs
                 )
 
-
+                # CRITICAL: For Wan22 models with dual transformers, temporarily offload one to CPU
+                # before moving LoRA to GPU. This frees a large contiguous block to reduce fragmentation.
+                transformer_2_was_on_gpu = False
+                transformer_2_temp_offloaded = False
+                
+                # Check if this is a Wan22 model with dual transformers
+                if hasattr(self.sd, 'model') and hasattr(self.sd.model, 'transformer_2'):
+                    try:
+                        # Check if transformer_2 is on GPU
+                        transformer_2_device = str(next(self.sd.model.transformer_2.parameters()).device)
+                        transformer_2_was_on_gpu = 'cuda' in transformer_2_device.lower()
+                        
+                        if transformer_2_was_on_gpu:
+                            print("Temporarily offloading transformer_2 to CPU to free GPU memory for LoRA...")
+                            import gc
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            self.sd.model.transformer_2.to("cpu")
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            transformer_2_temp_offloaded = True
+                            print("Transformer_2 offloaded to CPU")
+                    except Exception as e:
+                        print(f"Could not check/offload transformer_2: {e}")
+                
+                # Aggressive cache clearing before moving LoRA to GPU
+                # This helps reduce fragmentation on ROCm/HIP, especially on Strix Halo
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # Ensure all operations complete
+                
+                # Check memory before moving LoRA
+                if torch.cuda.is_available():
+                    device = torch.cuda.current_device()
+                    total_mem = torch.cuda.get_device_properties(device).total_memory / 1024**3
+                    reserved_mem = torch.cuda.memory_reserved(device) / 1024**3
+                    allocated_mem = torch.cuda.memory_allocated(device) / 1024**3
+                    free_mem = total_mem - reserved_mem
+                    print(f"Memory before LoRA move: {free_mem:.2f} GB free / {total_mem:.2f} GB total (allocated: {allocated_mem:.2f} GB, reserved: {reserved_mem:.2f} GB)")
+                
                 # todo switch everything to proper mixed precision like this
-                self.network.force_to(self.device_torch, dtype=torch.float32)
+                try:
+                    self.network.force_to(self.device_torch, dtype=torch.float32)
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                        # Try one more aggressive clear
+                        print("OOM moving LoRA to GPU, attempting aggressive memory cleanup...")
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        # Try again
+                        self.network.force_to(self.device_torch, dtype=torch.float32)
+                    else:
+                        raise
+                
+                # Restore transformer_2 to GPU if we temporarily offloaded it
+                if transformer_2_temp_offloaded:
+                    print("Restoring transformer_2 to GPU after LoRA move...")
+                    try:
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        self.sd.model.transformer_2.to(self.device_torch)
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        print("Transformer_2 restored to GPU successfully")
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower() or "hip" in str(e).lower():
+                            print("WARNING: OOM restoring transformer_2 to GPU - keeping on CPU (will use low_vram mode)")
+                            # Keep on CPU - the model will handle offloading during training
+                        else:
+                            raise
                 # give network to sd so it can use it
                 self.sd.network = self.network
                 self.network._update_torch_multiplier()
@@ -2090,12 +2270,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.before_dataset_load()
         # load datasets if passed in the root process
         if self.datasets is not None:
+            print("Loading main dataset...")
             self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)
+            print("Main dataset loaded successfully")
         if self.datasets_reg is not None:
+            print("Loading regularization dataset...")
             self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
                                                                 self.sd)
+            print("Regularization dataset loaded successfully")
 
+        print("All datasets loaded, flushing cache...")
         flush()
+        print("Cache flushed, proceeding to training loop setup...")
         self.last_save_step = self.step_num
         ### HOOK ###
         self.hook_before_train_loop()
@@ -2261,8 +2447,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
-                error_str = str(e).lower()
-                if "cuda out of memory" in error_str or "hip out of memory" in error_str or "out of memory" in error_str:
+                if "CUDA out of memory" in str(e):
                     did_oom = True
                 else:
                     raise  # not an OOM; surface real errors
