@@ -101,14 +101,10 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
     });
     jd['Idle'] = { name: 'Idle', jobs: [] };
     jobs.forEach(job => {
-      const gpu = gpuList.find(gpu => job.gpu_ids?.split(',').includes(gpu.index.toString()));
-      if (gpu && ['queued', 'running', 'stopping'].includes(job.status)) {
-        const key = `${gpu.index}`;
-        if (key in jd) {
-          jd[key].jobs.push(job);
-        } else {
-          jd['Idle'].jobs.push(job);
-        }
+      const gpu = gpuList.find(gpu => job.gpu_ids?.split(',').includes(gpu.index.toString())) as GpuInfo;
+      const key = `${gpu?.index || '0'}`;
+      if (['queued', 'running', 'stopping'].includes(job.status) && key in jd) {
+        jd[key].jobs.push(job);
       } else {
         jd['Idle'].jobs.push(job);
       }
