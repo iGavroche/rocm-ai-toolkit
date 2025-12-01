@@ -93,6 +93,11 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         self.lora_dim = lora_dim
         self.full_rank = network.network_type.lower() == "fullrank"
 
+        # Get device from parent module to ensure LoRA modules are created on the same device
+        # This is critical for ROCm - LoRA modules must match parent device
+        # Matching musubi-tuner approach: ensure parent is on GPU, then LoRA inherits device
+        parent_device = org_module.weight.device
+        
         if org_module.__class__.__name__ in CONV_MODULES:
             kernel_size = org_module.kernel_size
             stride = org_module.stride
@@ -110,6 +115,21 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
             else:
                 self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
                 self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=use_bias)
+        
+        # CRITICAL: Move LoRA modules to parent device AFTER they're registered as children
+        # PyTorch modules are created on CPU by default, so we must explicitly move them
+        # This ensures LoRA parameters are on the same device as parent module parameters
+        # Move the entire LoRAModule to parent device - this will move all submodules
+        self.to(parent_device)
+        
+        # Also explicitly move submodules to ensure they're on the correct device
+        # This is a double-check for ROCm compatibility
+        if not isinstance(self.lora_up, IdentityModule):
+            self.lora_up.to(parent_device)
+        self.lora_down.to(parent_device)
+        
+        # Note: PyTorch's .to() handles device placement correctly
+        # We don't need to verify here - force_to() will ensure correct device placement
 
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error

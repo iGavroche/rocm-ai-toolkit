@@ -3080,18 +3080,28 @@ class StableDiffusion:
             }
 
         # text encoder
+        # For ROCm, use device_torch to ensure text encoder stays on GPU (matching musubi-tuner)
+        try:
+            from toolkit.backend_utils import is_rocm_available
+            is_rocm = is_rocm_available()
+        except ImportError:
+            is_rocm = False
+        
+        # Use device_torch for ROCm to ensure GPU placement, te_device_torch for CUDA
+        text_encoder_device = self.device_torch if (is_rocm and 'text_encoder' in active_modules) else (self.te_device_torch if 'text_encoder' in active_modules else 'cpu')
+        
         if isinstance(self.text_encoder, list):
             state['text_encoder'] = []
             for i, encoder in enumerate(self.text_encoder):
                 state['text_encoder'].append({
                     'training': 'text_encoder' in training_modules,
-                    'device': self.te_device_torch if 'text_encoder' in active_modules else 'cpu',
+                    'device': text_encoder_device,
                     'requires_grad': 'text_encoder' in training_modules,
                 })
         else:
             state['text_encoder'] = {
                 'training': 'text_encoder' in training_modules,
-                'device': self.te_device_torch if 'text_encoder' in active_modules else 'cpu',
+                'device': text_encoder_device,
                 'requires_grad': 'text_encoder' in training_modules,
             }
 

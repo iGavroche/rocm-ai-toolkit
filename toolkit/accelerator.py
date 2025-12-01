@@ -15,12 +15,12 @@ def get_accelerator() -> Accelerator:
         except:
             is_rocm = False
         
-        # For ROCm, disable automatic device placement to prevent HIP errors
-        # We'll handle device placement manually with error handling
+        # For ROCm, use device_placement=True (default) to allow Accelerate to place models on GPU
+        # Matching musubi-tuner approach: models are loaded to accelerator.device and kept there
         if is_rocm:
-            # Create Accelerator with device_placement=False to prevent automatic transfers
-            global_accelerator = Accelerator(device_placement=False)
-            # Also monkey patch prepare_model to prevent device transfers
+            # Create Accelerator with device_placement=True (default) to allow GPU placement
+            global_accelerator = Accelerator(device_placement=True)
+            # Monkey patch prepare_model to allow device placement (but with error handling)
             _patch_accelerate_for_rocm(global_accelerator)
         else:
             global_accelerator = Accelerator()
@@ -36,17 +36,16 @@ def get_accelerator() -> Accelerator:
 
 def _patch_accelerate_for_rocm(accelerator: Accelerator):
     """
-    Monkey patch Accelerator.prepare_model to prevent device transfers on ROCm.
+    Monkey patch Accelerator.prepare_model to allow device transfers on ROCm with error handling.
     
-    This is necessary because even with device_placement=False, Accelerate's
-    prepare_model() may still call model.to(device) in some cases.
+    Matching musubi-tuner approach: allow device placement but catch HIP errors gracefully.
     """
     # Get the unbound method from the class
     original_prepare_model = Accelerator.prepare_model
     
     def patched_prepare_model(self, model, device_placement=None, evaluation_mode=False):
         """
-        Patched version that skips device transfer for ROCm.
+        Patched version that allows device transfer for ROCm with error handling.
         Note: When bound as a method, 'self' is automatically passed as the first argument.
         """
         try:
@@ -56,11 +55,23 @@ def _patch_accelerate_for_rocm(accelerator: Accelerator):
             is_rocm = False
         
         if is_rocm:
-            # Force device_placement=False for ROCm to prevent HIP errors
-            device_placement = False
+            # Allow device placement (default to True if not specified)
+            # This matches musubi-tuner's approach of loading models to accelerator.device
+            if device_placement is None:
+                device_placement = True
         
         # Call original unbound method with self explicitly
-        return original_prepare_model(self, model, device_placement=device_placement, evaluation_mode=evaluation_mode)
+        try:
+            return original_prepare_model(self, model, device_placement=device_placement, evaluation_mode=evaluation_mode)
+        except (RuntimeError, Exception) as e:
+            # Catch HIP errors during prepare but allow them to propagate
+            # The caller (safe_prepare) will handle them
+            error_str = str(e)
+            if "HIP" in error_str or "hipError" in error_str:
+                # Re-raise to let safe_prepare handle it
+                raise
+            else:
+                raise
     
     # Replace the method - bind it to the accelerator instance
     import types
@@ -70,17 +81,19 @@ def safe_prepare(accelerator: Accelerator, *args, device_placement=None):
     """
     Wrapper for accelerator.prepare() with ROCm error handling.
     
+    Matching musubi-tuner approach: models are already on GPU from loading,
+    and we allow Accelerate to place them on GPU with device_placement=True.
+    
     For ROCm, this function:
-    - Ensures models are on CPU before prepare()
-    - Uses device_placement=False to disable automatic device transfer
-    - Manually handles device placement with error handling
-    - Falls back gracefully if HIP errors occur
+    - Models should already be on GPU from model loading
+    - Uses device_placement=True (or provided value) to allow GPU placement
+    - Handles HIP errors gracefully if they occur during prepare()
     
     Args:
         accelerator: The Accelerator instance
         *args: Objects to prepare (models, optimizers, etc.)
         device_placement: Optional list of booleans for device placement control.
-                         For ROCm, defaults to False (no automatic placement).
+                         For ROCm, defaults to True (allow GPU placement).
     
     Returns:
         Prepared objects in the same order as args
@@ -92,88 +105,59 @@ def safe_prepare(accelerator: Accelerator, *args, device_placement=None):
         is_rocm = False
     
     if is_rocm:
-        # For ROCm, handle device placement carefully
+        # For ROCm, synchronize GPU before prepare
         synchronize_gpu()
         
-        # Ensure all models are on CPU before prepare
-        prepared_args = []
-        for arg in args:
-            if hasattr(arg, 'to') and hasattr(arg, 'parameters'):
-                # It's a model/module - ensure it's on CPU
-                try:
-                    arg.to("cpu")
-                except (RuntimeError, Exception) as e:
-                    if "HIP" in str(e) or "hipError" in str(e):
-                        # Already on CPU or HIP error, continue
-                        pass
-                    else:
-                        raise
-            prepared_args.append(arg)
+        # Models should already be on GPU from model loading (matching musubi-tuner)
+        # Don't move to CPU - let Accelerate handle device placement
         
-        # For ROCm, use device_placement=False to disable automatic device transfer
+        # For ROCm, use device_placement=True (default) to allow GPU placement
+        # This matches musubi-tuner's approach
         if device_placement is None:
-            # Create a list of False for each argument (disable automatic placement)
-            device_placement = [False] * len(args)
+            # Create a list of True for each argument (allow GPU placement)
+            device_placement = [True] * len(args)
         
         try:
-            # Call prepare with device_placement=False
+            # Call prepare with device_placement=True to allow GPU placement
             # Wrap in try/except to catch HIP errors that occur DURING prepare()
             try:
-                result = accelerator.prepare(*prepared_args, device_placement=device_placement)
+                result = accelerator.prepare(*args, device_placement=device_placement)
             except (RuntimeError, Exception) as prepare_error:
-                # On ROCm, catch any RuntimeError during prepare() - likely HIP/device transfer related
-                # AcceleratorError is a RuntimeError subclass, so this will catch it
+                # On ROCm, catch HIP errors during prepare() but don't force CPU fallback
+                # Let the error propagate so caller can handle it appropriately
                 error_str = str(prepare_error)
                 error_type = type(prepare_error).__name__
-                error_type_str = str(type(prepare_error))
                 
-                # Check if it's a device-related error (HIP, Accelerator, or any RuntimeError on ROCm)
-                is_accelerator_error = (
-                    "AcceleratorError" in error_type or 
-                    "AcceleratorError" in error_type_str or
-                    (hasattr(prepare_error, '__class__') and "Accelerator" in prepare_error.__class__.__name__)
-                )
                 is_hip_error = "HIP" in error_str or "hipError" in error_str or "hipErrorInvalidValue" in error_str
                 
-                # On ROCm, catch ANY RuntimeError during prepare as it's likely device-related
-                # This is more permissive but necessary for ROCm compatibility
-                if is_rocm and isinstance(prepare_error, RuntimeError):
-                    # On ROCm, any RuntimeError during prepare is likely HIP/device related
-                    print(f"Warning: Accelerate prepare() failed on ROCm (likely device transfer), keeping models on CPU")
+                if is_hip_error:
+                    # Log the error but re-raise - models should stay on GPU
+                    print(f"Warning: Accelerate prepare() encountered HIP error on ROCm")
                     print(f"  Error type: {error_type}")
                     print(f"  Error message: {error_str[:200]}")
-                    # Return arguments as-is (on CPU) - they'll work for training
-                    if len(prepared_args) == 1:
-                        return prepared_args[0]
-                    return tuple(prepared_args) if len(prepared_args) > 1 else prepared_args[0]
-                elif is_hip_error or is_accelerator_error:
-                    print(f"Warning: Accelerate prepare() failed with HIP/Accelerator error, keeping models on CPU")
-                    print(f"  Error type: {error_type}")
-                    print(f"  Error message: {error_str[:200]}")
-                    # Return arguments as-is (on CPU) - they'll work for training
-                    if len(prepared_args) == 1:
-                        return prepared_args[0]
-                    return tuple(prepared_args) if len(prepared_args) > 1 else prepared_args[0]
+                    print(f"  Models will remain on their current device")
+                    # Re-raise to let caller handle it
+                    raise
                 else:
+                    # Non-HIP errors should propagate
                     raise
             
             # Accelerate returns a tuple if multiple args, single value if one arg
-            # For ROCm, we keep models on CPU and don't attempt device transfer
-            # The models will be moved to device during forward passes when needed
-            if len(prepared_args) == 1:
+            # Models should now be on GPU (matching musubi-tuner)
+            if len(args) == 1:
                 return result
             return result
             
         except (RuntimeError, Exception) as e:
             error_str = str(e)
             error_type = type(e).__name__
-            # Catch AcceleratorError (which is a RuntimeError) and HIP errors
-            if "HIP" in error_str or "hipError" in error_str or "AcceleratorError" in error_type:
-                print(f"Warning: Accelerate prepare() failed on ROCm, returning models as-is: {e}")
-                # Return arguments as-is (on CPU)
-                if len(prepared_args) == 1:
-                    return prepared_args[0]
-                return tuple(prepared_args) if len(prepared_args) > 1 else prepared_args[0]
+            # For HIP errors, re-raise - don't force CPU fallback
+            # The models should stay on GPU
+            if "HIP" in error_str or "hipError" in error_str:
+                print(f"Warning: Accelerate prepare() failed with HIP error on ROCm")
+                print(f"  Error: {error_str[:200]}")
+                # Re-raise - models should stay on GPU, caller will handle
+                raise
             else:
                 raise
     else:

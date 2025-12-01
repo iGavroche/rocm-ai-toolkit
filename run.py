@@ -106,7 +106,12 @@ def main():
         help='Skip system safeguards check (use with caution - can break desktop environment)'
     )
     
+    # Parse args FIRST before using them
     args = parser.parse_args()
+    
+    # Set up logging IMMEDIATELY after parsing args, before anything else
+    if args.log is not None:
+        setup_log_to_file(args.log)
     
     # Clear Python bytecode cache if requested
     if args.clear_cache:
@@ -131,9 +136,6 @@ def main():
                     except Exception:
                         pass
         print_acc("Cache cleared!")
-    
-    if args.log is not None:
-        setup_log_to_file(args.log)
 
     config_file_list = args.config_file_list
     

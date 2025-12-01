@@ -60,6 +60,31 @@ def add_first_frame_conditioning(
     # Prepare for VAE encoding (bs, channels, num_frames, height, width)
     # video_condition = video_condition.permute(0, 2, 1, 3, 4)
 
+    # Ensure VAE is on the correct device before encoding (matching mainline pattern)
+    # For ROCm, handle device transfer with error handling
+    if vae.device == torch.device('cpu'):
+        try:
+            from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+            is_rocm = is_rocm_available()
+        except ImportError:
+            is_rocm = False
+        
+        if is_rocm:
+            synchronize_gpu()
+            try:
+                vae.to(device)
+                synchronize_gpu()
+            except (RuntimeError, Exception) as e:
+                error_str = str(e)
+                if "HIP" in error_str or "hipError" in error_str:
+                    # Keep VAE on CPU if device transfer fails
+                    # Encode will happen on CPU, then move output to device
+                    pass
+                else:
+                    raise
+        else:
+            vae.to(device)
+    
     # Encode with VAE
     latent_condition = vae.encode(
         video_condition.to(device, dtype)

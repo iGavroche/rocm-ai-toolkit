@@ -183,3 +183,4 @@ aitk_db.db
 /notes.md
 /datadatasets/
 output/
+*_log*.txt

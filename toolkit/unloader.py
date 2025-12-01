@@ -38,6 +38,10 @@ def unload_text_encoder(model: "BaseModel"):
     # we need to make it appear as a text encoder module without actually having one so all
     # to functions and what not will work.
 
+    # For ROCm, delete text encoder instead of moving to CPU to avoid RAM usage
+    from toolkit.backend_utils import is_rocm_available
+    is_rocm = is_rocm_available()
+
     if model.text_encoder is not None:
         if isinstance(model.text_encoder, list):
             text_encoder_list = []
@@ -47,18 +51,35 @@ def unload_text_encoder(model: "BaseModel"):
             if hasattr(pipe, "text_encoder"):
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
-                pipe.text_encoder.to('cpu')
+                if is_rocm:
+                    # For ROCm, delete instead of moving to CPU to avoid RAM usage
+                    del pipe.text_encoder
+                    import gc
+                    gc.collect()
+                else:
+                    pipe.text_encoder.to('cpu')
                 pipe.text_encoder = te
 
             i = 2
             while hasattr(pipe, f"text_encoder_{i}"):
                 te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
                 text_encoder_list.append(te)
+                if is_rocm:
+                    # For ROCm, delete instead of moving to CPU
+                    old_te = getattr(pipe, f"text_encoder_{i}")
+                    del old_te
+                    import gc
+                    gc.collect()
                 setattr(pipe, f"text_encoder_{i}", te)
                 i += 1
             model.text_encoder = text_encoder_list
         else:
             # only has a single text encoder
+            if is_rocm:
+                # For ROCm, delete instead of moving to CPU to avoid RAM usage
+                del model.text_encoder
+                import gc
+                gc.collect()
             model.text_encoder = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
 
     flush()

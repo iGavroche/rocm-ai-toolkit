@@ -86,6 +86,7 @@ const startAndWatchJob = (job: Job) => {
       CUDA_DEVICE_ORDER: 'PCI_BUS_ID',
       CUDA_VISIBLE_DEVICES: `${job.gpu_ids}`,
       IS_AI_TOOLKIT_UI: '1',
+      PYTHONUNBUFFERED: '1', // Disable Python output buffering for immediate log writes
     };
 
     // HF_TOKEN
@@ -100,41 +101,29 @@ const startAndWatchJob = (job: Job) => {
     try {
       let subprocess;
 
-      if (isWindows) {
-        // Spawn Python directly on Windows so the process can survive parent exit
-        subprocess = spawn(pythonPath, args, {
-          env: {
-            ...process.env,
-            ...additionalEnv,
-          },
-          cwd: TOOLKIT_ROOT,
-          detached: true,
-          windowsHide: true,
-          stdio: 'ignore', // don't tie stdio to parent
-        });
-      } else {
-        // For non-Windows platforms, fully detach and ignore stdio so it survives daemon-like
-        subprocess = spawn(pythonPath, args, {
-          detached: true,
-          stdio: 'ignore',
-          env: {
-            ...process.env,
-            ...additionalEnv,
-          },
-          cwd: TOOLKIT_ROOT,
-        });
-      }
-
-      // Important: let the child run independently of this Node process.
-      if (subprocess.unref) {
-        subprocess.unref();
-      }
-
-      // Optionally write a pid file for future management (stop/inspect) without keeping streams open
+      // Spawn Python directly - same approach for all platforms
+      // The process will run independently and handle its own logging via --log
+      subprocess = spawn(pythonPath, args, {
+        env: {
+          ...process.env,
+          ...additionalEnv,
+        },
+        cwd: TOOLKIT_ROOT,
+        detached: true,
+        stdio: 'ignore', // don't tie stdio to parent - Python handles logging via --log
+        ...(isWindows && { windowsHide: true }),
+      });
+      
+      // Write the PID file
       try {
         fs.writeFileSync(path.join(trainingFolder, 'pid.txt'), String(subprocess.pid ?? ''), { flag: 'w' });
       } catch (e) {
         console.error('Error writing pid file:', e);
+      }
+      
+      // Important: let the child run independently of this Node process.
+      if (subprocess.unref) {
+        subprocess.unref();
       }
 
       // (No stdout/stderr listeners — logging should go to --log handled by your Python)

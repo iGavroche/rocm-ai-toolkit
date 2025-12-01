@@ -1,5 +1,5 @@
 import torch
-from toolkit.models.wan21.wan_utils import add_first_frame_conditioning
+from toolkit.models.wan21.wan_utils import add_first_frame_conditioning, add_first_frame_conditioning_v22
 from toolkit.prompt_utils import PromptEmbeds
 from PIL import Image
 import torch
@@ -330,21 +330,27 @@ class Wan2214bI2VModel(Wan2214bModel):
     ):
         # videos come in (bs, num_frames, channels, height, width)
         # images come in (bs, channels, height, width)
-        with torch.no_grad():
-            frames = batch.tensor
-            if len(frames.shape) == 4:
-                first_frames = frames
-            elif len(frames.shape) == 5:
-                first_frames = frames[:, 0]
-            else:
-                raise ValueError(f"Unknown frame shape {frames.shape}")
-            
-            # Add conditioning using the standalone function
-            conditioned_latent = add_first_frame_conditioning(
-                latent_model_input=latent_model_input,
-                first_frame=first_frames,
-                vae=self.vae
-            )
+        conditioned_latent = latent_model_input
+        
+        if batch.dataset_config.do_i2v:
+            with torch.no_grad():
+                frames = batch.tensor
+                if len(frames.shape) == 4:
+                    first_frames = frames
+                elif len(frames.shape) == 5:
+                    first_frames = frames[:, 0]
+                else:
+                    raise ValueError(f"Unknown frame shape {frames.shape}")
+                
+                # Ensure first_frames is on the correct device and dtype (matching mainline pattern)
+                first_frames = first_frames.to(self.device_torch, dtype=self.torch_dtype)
+                
+                # Add conditioning using the standalone function
+                conditioned_latent = add_first_frame_conditioning(
+                    latent_model_input=latent_model_input,
+                    first_frame=first_frames,
+                    vae=self.vae
+                )
         
         noise_pred = self.model(
             hidden_states=conditioned_latent,

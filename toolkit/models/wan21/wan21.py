@@ -487,10 +487,47 @@ class Wan21(BaseModel):
         is_rocm = is_rocm_available()
         
         if is_rocm:
-            # ROCm: keep transformer on CPU initially, Accelerate will handle it
-            synchronize_gpu()
-            self.print_and_status_update("ROCm: keeping transformer on CPU (Accelerate will handle device placement)")
-            pipe.transformer = pipe.transformer.cpu()
+            # ROCm: Check actual device of transformer parameters, not just the device property
+            # Get device from first parameter to check actual device
+            actual_device = None
+            try:
+                for param in pipe.transformer.parameters():
+                    actual_device = param.device
+                    break
+            except:
+                pass
+            
+            # If transformer is already on GPU, keep it there for LoRA compatibility
+            if actual_device is not None and actual_device.type != 'cpu':
+                self.print_and_status_update("ROCm: Transformer already on GPU, keeping it there")
+            else:
+                # ALWAYS try to move to GPU for ROCm - LoRA modules MUST be on same device as parent modules
+                # This is critical for training to work
+                synchronize_gpu()
+                try:
+                    self.print_and_status_update("ROCm: Attempting to move transformer to GPU for LoRA compatibility...")
+                    pipe.transformer = pipe.transformer.to(self.device_torch)
+                    # Verify the move worked
+                    verify_device = None
+                    try:
+                        for param in pipe.transformer.parameters():
+                            verify_device = param.device
+                            break
+                    except:
+                        pass
+                    if verify_device is not None and verify_device.type != 'cpu':
+                        self.print_and_status_update("ROCm: ✓ Successfully moved transformer to GPU")
+                    else:
+                        self.print_and_status_update("ROCm: ⚠ Warning: Transformer move to GPU may have failed, keeping on CPU")
+                        pipe.transformer = pipe.transformer.cpu()
+                except (RuntimeError, Exception) as e:
+                    error_str = str(e)
+                    if "HIP" in error_str or "hipError" in error_str:
+                        self.print_and_status_update(f"ROCm: ⚠ HIP error moving transformer to GPU, keeping on CPU: {error_str[:100]}")
+                        pipe.transformer = pipe.transformer.cpu()
+                    else:
+                        self.print_and_status_update(f"ROCm: ✗ Error moving transformer to GPU: {error_str[:100]}")
+                        raise
         else:
             pipe.transformer = pipe.transformer.to(self.device_torch)
 
@@ -515,9 +552,49 @@ class Wan21(BaseModel):
         text_encoder.eval()
         
         # Handle transformer again (might be needed for some paths)
+        # For ROCm + LoRA: MUST keep on GPU (matching musubi-tuner approach)
+        # musubi-tuner loads model directly to accelerator.device and keeps it there
         if is_rocm:
-            # Keep on CPU
-            pipe.transformer = pipe.transformer.cpu()
+            # Check actual device of transformer parameters
+            actual_device = None
+            try:
+                for param in pipe.transformer.parameters():
+                    actual_device = param.device
+                    break
+            except:
+                pass
+            
+            # For ROCm with LoRA, we MUST keep transformer on GPU
+            # This matches musubi-tuner's approach: load to device and keep there
+            if actual_device is not None and actual_device.type != 'cpu':
+                self.print_and_status_update("ROCm: Transformer on GPU - keeping there for LoRA (matching musubi-tuner)")
+            else:
+                # Force move to GPU for LoRA - this is critical
+                synchronize_gpu()
+                try:
+                    self.print_and_status_update("ROCm: Moving transformer to GPU for LoRA (matching musubi-tuner approach)...")
+                    pipe.transformer = pipe.transformer.to(self.device_torch)
+                    synchronize_gpu()
+                    # Verify move worked
+                    verify_device = None
+                    try:
+                        for param in pipe.transformer.parameters():
+                            verify_device = param.device
+                            break
+                    except:
+                        pass
+                    if verify_device is not None and verify_device.type != 'cpu':
+                        self.print_and_status_update("ROCm: ✓ Transformer on GPU for LoRA")
+                    else:
+                        raise RuntimeError("Transformer move to GPU failed - verification shows CPU")
+                except (RuntimeError, Exception) as e:
+                    error_str = str(e)
+                    if "HIP" in error_str or "hipError" in error_str:
+                        # For LoRA, we can't keep on CPU - this will cause device mismatch
+                        self.print_and_status_update(f"ROCm: ✗ CRITICAL: Cannot keep transformer on CPU with LoRA - HIP error: {error_str[:100]}")
+                        raise RuntimeError(f"Cannot train LoRA with transformer on CPU due to device mismatch. HIP error: {error_str[:100]}")
+                    else:
+                        raise
         else:
             pipe.transformer = pipe.transformer.to(self.device_torch)
         flush()

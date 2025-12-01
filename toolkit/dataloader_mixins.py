@@ -1871,6 +1871,57 @@ class TextEmbeddingCachingMixin:
             
             did_move = False
 
+            # For ROCm, ensure text encoder is on GPU before caching (matching musubi-tuner approach)
+            from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+            is_rocm = is_rocm_available()
+            if is_rocm:
+                synchronize_gpu()
+                # Ensure text encoder is on GPU before caching
+                if hasattr(self.sd, 'text_encoder') and self.sd.text_encoder is not None:
+                    if isinstance(self.sd.text_encoder, list):
+                        for te in self.sd.text_encoder:
+                            try:
+                                # Check if already on GPU
+                                actual_device = None
+                                try:
+                                    for param in te.parameters():
+                                        actual_device = param.device
+                                        break
+                                except:
+                                    pass
+                                if actual_device is None or actual_device.type == 'cpu':
+                                    print_acc("ROCm: Moving text encoder to GPU for caching...")
+                                    te.to(self.sd.device_torch)
+                                    synchronize_gpu()
+                                    print_acc("ROCm: ✓ Text encoder on GPU for caching")
+                            except (RuntimeError, Exception) as e:
+                                error_str = str(e)
+                                if "HIP" in error_str or "hipError" in error_str:
+                                    print_acc(f"ROCm: ⚠ Warning: Could not move text encoder to GPU: {error_str[:100]}")
+                                else:
+                                    raise
+                    else:
+                        try:
+                            # Check if already on GPU
+                            actual_device = None
+                            try:
+                                for param in self.sd.text_encoder.parameters():
+                                    actual_device = param.device
+                                    break
+                            except:
+                                pass
+                            if actual_device is None or actual_device.type == 'cpu':
+                                print_acc("ROCm: Moving text encoder to GPU for caching...")
+                                self.sd.text_encoder.to(self.sd.device_torch)
+                                synchronize_gpu()
+                                print_acc("ROCm: ✓ Text encoder on GPU for caching")
+                        except (RuntimeError, Exception) as e:
+                            error_str = str(e)
+                            if "HIP" in error_str or "hipError" in error_str:
+                                print_acc(f"ROCm: ⚠ Warning: Could not move text encoder to GPU: {error_str[:100]}")
+                            else:
+                                raise
+
             # use tqdm to show progress
             i = 0
             for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):

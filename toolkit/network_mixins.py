@@ -804,17 +804,32 @@ class ToolkitNetworkMixin:
             if is_rocm:
                 synchronize_gpu()
                 try:
-                    # Step-by-step device transfer for ROCm
-                    lora.to("cpu")  # Ensure on CPU first
-                    lora.to(device)
-                    lora.to(dtype=dtype)
+                    # For ROCm, move LoRA modules directly to device (matching musubi-tuner approach)
+                    # Don't move to CPU first - that can cause device mismatch issues
+                    # Move the entire LoRAModule first, then verify submodules
+                    lora.to(device, dtype=dtype)
+                    
+                    # Explicitly move submodules to ensure they're on the correct device
+                    # PyTorch's .to() handles device placement correctly, including 'cuda' vs 'cuda:0'
+                    if hasattr(lora, 'lora_down'):
+                        lora.lora_down.to(device, dtype=dtype)
+                    
+                    if hasattr(lora, 'lora_up') and not isinstance(lora.lora_up, torch.nn.Identity):
+                        lora.lora_up.to(device, dtype=dtype)
+                    
+                    synchronize_gpu()
                 except (RuntimeError, Exception) as e:
                     if "HIP" in str(e) or "hipError" in str(e):
-                        # Keep on CPU if HIP error
-                        lora.to("cpu")
+                        # For LoRA, we can't keep on CPU - this will cause device mismatch
+                        raise RuntimeError(f"Cannot train LoRA with modules on CPU due to device mismatch. HIP error: {str(e)[:100]}")
                     else:
                         raise
             else:
+                # Explicitly move submodules for non-ROCm as well
+                if hasattr(lora, 'lora_down'):
+                    lora.lora_down.to(device, dtype=dtype)
+                if hasattr(lora, 'lora_up') and not isinstance(lora.lora_up, torch.nn.Identity):
+                    lora.lora_up.to(device, dtype=dtype)
                 lora.to(device, dtype)
 
     def get_all_modules(self: Network) -> List[Module]:

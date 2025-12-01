@@ -11,16 +11,42 @@ def print_acc(*args, **kwargs):
 class Logger:
     def __init__(self, filename):
         self.terminal = sys.stdout
-        self.log = open(filename, 'a')
+        try:
+            # Use unbuffered mode (buffering=1 means line buffered, but we want immediate writes)
+            # Open in append mode with line buffering
+            self.log = open(filename, 'a', buffering=1)
+            # Force a write to ensure file is created and writable
+            self.log.write("")
+            self.log.flush()
+        except Exception as e:
+            # If we can't open the log file, at least try to write to terminal
+            print(f"Warning: Could not open log file {filename}: {e}", file=sys.stderr)
+            self.log = None
 
     def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()  # Make sure it's written immediately
+        try:
+            if self.log is not None:
+                self.log.write(message)
+                self.log.flush()  # Make sure it's written immediately
+        except Exception:
+            # If log write fails, continue silently to avoid breaking the process
+            pass
+        try:
+            self.terminal.write(message)
+        except (OSError, AttributeError):
+            # Terminal might be closed/ignored when spawned with stdio: 'ignore'
+            pass
 
     def flush(self):
-        self.terminal.flush()
-        self.log.flush()
+        try:
+            if self.log is not None:
+                self.log.flush()
+        except Exception:
+            pass
+        try:
+            self.terminal.flush()
+        except (OSError, AttributeError):
+            pass
 
 
 def setup_log_to_file(filename):

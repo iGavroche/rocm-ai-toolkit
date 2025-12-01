@@ -1,3 +1,4 @@
+from __future__ import annotations
 from functools import partial
 import os
 from typing import Any, Dict, Optional, Union, List
@@ -119,9 +120,11 @@ class DualWanTransformer3DModel(torch.nn.Module):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        # Use getattr to avoid scoping issues with torch
+        _torch_module = __import__('torch')
         # determine if doing high noise or low noise by meaning the timestep.
         # timesteps are in the range of 0 to 1000, so we can use a threshold
-        with torch.no_grad():
+        with _torch_module.no_grad():
             if timestep.float().mean().item() > self.boundary:
                 t_name = "transformer_1"
             else:
@@ -169,11 +172,10 @@ class DualWanTransformer3DModel(torch.nn.Module):
                         self.transformer.to(target_device)
                 except (RuntimeError, Exception) as e:
                     if "HIP" in str(e) or "hipError" in str(e):
-                        # If HIP error, try to sync and continue
+                        # If HIP error, continue without sync
                         # The model might already be on the correct device due to async errors
-                        import torch
-                        torch.cuda.synchronize() if torch.cuda.is_available() else None
                         # Don't raise - let it continue and see if it works
+                        pass
                     else:
                         raise
             else:
@@ -189,7 +191,52 @@ class DualWanTransformer3DModel(torch.nn.Module):
         )
 
     def to(self, *args, **kwargs) -> Self:
-        # do not do to, this will be handled separately
+        # For ROCm, we need to actually move the transformers when to() is called
+        # to ensure LoRA modules can be on the same device
+        device = None
+        dtype = None
+        
+        # Extract device and dtype from args/kwargs
+        for arg in args:
+            if isinstance(arg, (str, torch.device)):
+                device = torch.device(arg) if isinstance(arg, str) else arg
+            elif isinstance(arg, torch.dtype):
+                dtype = arg
+        
+        if 'device' in kwargs:
+            device = torch.device(kwargs['device']) if isinstance(kwargs['device'], str) else kwargs['device']
+        if 'dtype' in kwargs:
+            dtype = kwargs['dtype']
+        
+        # If device is specified, move both transformers
+        if device is not None:
+            from toolkit.backend_utils import is_rocm_available, synchronize_gpu
+            is_rocm = is_rocm_available()
+            
+            if is_rocm:
+                synchronize_gpu()
+                try:
+                    self.transformer_1.to(device)
+                    self.transformer_2.to(device)
+                    self.device_torch = device
+                    synchronize_gpu()
+                except (RuntimeError, Exception) as e:
+                    if "HIP" in str(e) or "hipError" in str(e):
+                        # Keep on CPU if HIP error
+                        pass
+                    else:
+                        raise
+            else:
+                self.transformer_1.to(device)
+                self.transformer_2.to(device)
+                self.device_torch = device
+        
+        # If dtype is specified, apply it
+        if dtype is not None:
+            self.transformer_1.to(dtype=dtype)
+            self.transformer_2.to(dtype=dtype)
+            self.torch_dtype = dtype
+        
         return self
 
 
@@ -361,15 +408,20 @@ class Wan2214bModel(Wan21):
             is_rocm = is_rocm_available()
             
             if is_rocm:
-                # For ROCm, model loading to device can be problematic
-                # Keep model on CPU initially, let Accelerate handle device placement
-                self.print_and_status_update("ROCm detected: keeping transformer 1 on CPU (will be moved by Accelerate)")
-                # Ensure model is on CPU with correct dtype
-                transformer_1 = transformer_1.cpu()
-                if dtype != transformer_1.dtype:
-                    transformer_1 = transformer_1.to(dtype=dtype)
-                # Don't move to GPU here - let Accelerate.prepare() handle it
-                # This avoids HIP errors during initial load
+                # For ROCm, try to move to GPU with error handling
+                # If it fails, fall back to CPU and let Accelerate handle it
+                try:
+                    self.print_and_status_update("ROCm: attempting to move transformer 1 to GPU...")
+                    transformer_1 = transformer_1.to(self.device_torch, dtype=dtype)
+                    self.print_and_status_update("✓ Transformer 1 moved to GPU successfully")
+                except (RuntimeError, Exception) as e:
+                    if "HIP" in str(e) or "hipError" in str(e):
+                        self.print_and_status_update(f"Warning: GPU transfer failed, keeping on CPU (will be moved by Accelerate): {e}")
+                        transformer_1 = transformer_1.cpu()
+                        if dtype != transformer_1.dtype:
+                            transformer_1 = transformer_1.to(dtype=dtype)
+                    else:
+                        raise
             else:
                 # CUDA: normal transfer
                 try:
@@ -399,11 +451,31 @@ class Wan2214bModel(Wan21):
             self.print_and_status_update("Moving transformer 1 to CPU")
             transformer_1.to("cpu")
         else:
-            # For ROCm, keep on CPU - Accelerate will handle device placement
+            # For ROCm, try to keep on GPU if transfer succeeded earlier - LoRA modules need same device
             from toolkit.backend_utils import is_rocm_available
             if is_rocm_available():
-                self.print_and_status_update("ROCm: keeping transformer 1 on CPU (Accelerate will handle device placement)")
-                transformer_1.to("cpu")
+                # Check actual parameter device, not just device property
+                actual_device = None
+                try:
+                    for param in transformer_1.parameters():
+                        actual_device = param.device
+                        break
+                except:
+                    pass
+                
+                if actual_device is not None and actual_device.type != 'cpu':
+                    self.print_and_status_update("ROCm: Transformer 1 is on GPU - keeping there for LoRA compatibility")
+                else:
+                    # Try to move to GPU for LoRA compatibility
+                    try:
+                        self.print_and_status_update("ROCm: Attempting to move transformer 1 to GPU for LoRA...")
+                        transformer_1 = transformer_1.to(self.device_torch)
+                        self.print_and_status_update("ROCm: ✓ Transformer 1 moved to GPU for LoRA")
+                    except (RuntimeError, Exception) as e:
+                        if "HIP" in str(e) or "hipError" in str(e):
+                            self.print_and_status_update(f"ROCm: ⚠ Keeping transformer 1 on CPU due to HIP error: {str(e)[:80]}")
+                        else:
+                            raise
             else:
                 transformer_1.to(self.device_torch)
 
@@ -457,15 +529,20 @@ class Wan2214bModel(Wan21):
             is_rocm = is_rocm_available()
             
             if is_rocm:
-                # For ROCm, model loading to device can be problematic
-                # Keep model on CPU initially, let Accelerate handle device placement
-                self.print_and_status_update("ROCm detected: keeping transformer 2 on CPU (will be moved by Accelerate)")
-                # Ensure model is on CPU with correct dtype
-                transformer_2 = transformer_2.cpu()
-                if dtype != transformer_2.dtype:
-                    transformer_2 = transformer_2.to(dtype=dtype)
-                # Don't move to GPU here - let Accelerate.prepare() handle it
-                # This avoids HIP errors during initial load
+                # For ROCm, try to move to GPU with error handling
+                # If it fails, fall back to CPU and let Accelerate handle it
+                try:
+                    self.print_and_status_update("ROCm: attempting to move transformer 2 to GPU...")
+                    transformer_2 = transformer_2.to(self.device_torch, dtype=dtype)
+                    self.print_and_status_update("✓ Transformer 2 moved to GPU successfully")
+                except (RuntimeError, Exception) as e:
+                    if "HIP" in str(e) or "hipError" in str(e):
+                        self.print_and_status_update(f"Warning: GPU transfer failed, keeping on CPU (will be moved by Accelerate): {e}")
+                        transformer_2 = transformer_2.cpu()
+                        if dtype != transformer_2.dtype:
+                            transformer_2 = transformer_2.to(dtype=dtype)
+                    else:
+                        raise
             else:
                 # CUDA: normal transfer
                 try:
@@ -495,11 +572,31 @@ class Wan2214bModel(Wan21):
             self.print_and_status_update("Moving transformer 2 to CPU")
             transformer_2.to("cpu")
         else:
-            # For ROCm, keep on CPU - Accelerate will handle device placement
+            # For ROCm, try to keep on GPU if transfer succeeded earlier - LoRA modules need same device
             from toolkit.backend_utils import is_rocm_available
             if is_rocm_available():
-                self.print_and_status_update("ROCm: keeping transformer 2 on CPU (Accelerate will handle device placement)")
-                transformer_2.to("cpu")
+                # Check actual parameter device, not just device property
+                actual_device = None
+                try:
+                    for param in transformer_2.parameters():
+                        actual_device = param.device
+                        break
+                except:
+                    pass
+                
+                if actual_device is not None and actual_device.type != 'cpu':
+                    self.print_and_status_update("ROCm: Transformer 2 is on GPU - keeping there for LoRA compatibility")
+                else:
+                    # Try to move to GPU for LoRA compatibility
+                    try:
+                        self.print_and_status_update("ROCm: Attempting to move transformer 2 to GPU for LoRA...")
+                        transformer_2 = transformer_2.to(self.device_torch)
+                        self.print_and_status_update("ROCm: ✓ Transformer 2 moved to GPU for LoRA")
+                    except (RuntimeError, Exception) as e:
+                        if "HIP" in str(e) or "hipError" in str(e):
+                            self.print_and_status_update(f"ROCm: ⚠ Keeping transformer 2 on CPU due to HIP error: {str(e)[:80]}")
+                        else:
+                            raise
             else:
                 transformer_2.to(self.device_torch)
     

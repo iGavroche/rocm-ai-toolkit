@@ -131,7 +131,7 @@ detect_backend() {
             
             # Better VRAM fragmentation for large shared memory pools (128GB EVO-X2)
             if [ -z "$PYTORCH_ROCM_ALLOC_CONF" ]; then
-                export PYTORCH_ROCM_ALLOC_CONF="max_split_size_mb:256,garbage_collect=1"
+                export PYTORCH_ROCM_ALLOC_CONF="max_split_size_mb:768,garbage_collect=1"
                 print_info "Set PYTORCH_ROCM_ALLOC_CONF for better VRAM fragmentation"
             fi
             

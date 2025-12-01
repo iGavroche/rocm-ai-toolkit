@@ -716,73 +716,82 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # Import safe_prepare for ROCm compatibility
         from toolkit.accelerator import safe_prepare
         
-        # For ROCm, ensure models are on CPU before prepare
+        # For ROCm, synchronize GPU before prepare (models should already be on GPU from loading)
         from toolkit.backend_utils import is_rocm_available, synchronize_gpu
         is_rocm = is_rocm_available()
         
         if is_rocm:
             synchronize_gpu()
-            # Ensure VAE is on CPU
-            if hasattr(self.sd, 'vae') and self.sd.vae is not None:
-                try:
-                    self.sd.vae.to("cpu")
-                except (RuntimeError, Exception):
-                    pass  # Already on CPU or error handled
         
+        # Models are already on GPU from model loading (matching musubi-tuner approach)
+        # Prepare with device_placement=True to allow Accelerate to place models on GPU
         # # prepare all the models stuff for accelerator (hopefully we dont miss any)
-        self.sd.vae = safe_prepare(self.accelerator, self.sd.vae)
+        self.sd.vae = safe_prepare(self.accelerator, self.sd.vae, device_placement=[True])
+        # Explicitly ensure on device after prepare (matching musubi-tuner)
+        if hasattr(self.sd.vae, 'to') and self.sd.vae is not None:
+            try:
+                self.sd.vae.to(self.accelerator.device)
+            except (RuntimeError, Exception):
+                pass  # Already on device or error handled
+        
         if self.sd.unet is not None:
-            if is_rocm:
+            self.sd.unet = safe_prepare(self.accelerator, self.sd.unet, device_placement=[True])
+            # Explicitly ensure on device after prepare
+            if hasattr(self.sd.unet, 'to'):
                 try:
-                    self.sd.unet.to("cpu")
+                    self.sd.unet.to(self.accelerator.device)
                 except (RuntimeError, Exception):
                     pass
-            self.sd.unet = safe_prepare(self.accelerator, self.sd.unet)
             # todo always tdo it?
             self.modules_being_trained.append(self.sd.unet)
         if self.sd.text_encoder is not None and self.train_config.train_text_encoder:
             if isinstance(self.sd.text_encoder, list):
-                if is_rocm:
-                    for te in self.sd.text_encoder:
+                self.sd.text_encoder = [safe_prepare(self.accelerator, model, device_placement=[True]) for model in self.sd.text_encoder]
+                # Explicitly ensure on device after prepare
+                for te in self.sd.text_encoder:
+                    if hasattr(te, 'to'):
                         try:
-                            te.to("cpu")
+                            te.to(self.accelerator.device)
                         except (RuntimeError, Exception):
                             pass
-                self.sd.text_encoder = [safe_prepare(self.accelerator, model) for model in self.sd.text_encoder]
                 self.modules_being_trained.extend(self.sd.text_encoder)
             else:
-                if is_rocm:
+                self.sd.text_encoder = safe_prepare(self.accelerator, self.sd.text_encoder, device_placement=[True])
+                # Explicitly ensure on device after prepare
+                if hasattr(self.sd.text_encoder, 'to'):
                     try:
-                        self.sd.text_encoder.to("cpu")
+                        self.sd.text_encoder.to(self.accelerator.device)
                     except (RuntimeError, Exception):
                         pass
-                self.sd.text_encoder = safe_prepare(self.accelerator, self.sd.text_encoder)
                 self.modules_being_trained.append(self.sd.text_encoder)
         if self.sd.refiner_unet is not None and self.train_config.train_refiner:
-            if is_rocm:
+            self.sd.refiner_unet = safe_prepare(self.accelerator, self.sd.refiner_unet, device_placement=[True])
+            # Explicitly ensure on device after prepare
+            if hasattr(self.sd.refiner_unet, 'to'):
                 try:
-                    self.sd.refiner_unet.to("cpu")
+                    self.sd.refiner_unet.to(self.accelerator.device)
                 except (RuntimeError, Exception):
                     pass
-            self.sd.refiner_unet = safe_prepare(self.accelerator, self.sd.refiner_unet)
             self.modules_being_trained.append(self.sd.refiner_unet)
         # todo, do we need to do the network or will "unet" get it?
         if self.sd.network is not None:
-            if is_rocm:
+            self.sd.network = safe_prepare(self.accelerator, self.sd.network, device_placement=[True])
+            # Explicitly ensure on device after prepare
+            if hasattr(self.sd.network, 'to'):
                 try:
-                    self.sd.network.to("cpu")
+                    self.sd.network.to(self.accelerator.device)
                 except (RuntimeError, Exception):
                     pass
-            self.sd.network = safe_prepare(self.accelerator, self.sd.network)
             self.modules_being_trained.append(self.sd.network)
         if self.adapter is not None and self.adapter_config.train:
             # todo adapters may not be a module. need to check
-            if is_rocm:
+            self.adapter = safe_prepare(self.accelerator, self.adapter, device_placement=[True])
+            # Explicitly ensure on device after prepare
+            if hasattr(self.adapter, 'to'):
                 try:
-                    self.adapter.to("cpu")
+                    self.adapter.to(self.accelerator.device)
                 except (RuntimeError, Exception):
                     pass
-            self.adapter = safe_prepare(self.accelerator, self.adapter)
             self.modules_being_trained.append(self.adapter)
         
         # prepare other things (optimizers and schedulers don't need device placement)
@@ -1652,6 +1661,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
         print("[DEBUG] BaseSDTrainProcess.run() - sd.load_model() completed")
         sys.stdout.flush()
         
+        # After load_model(), ensure LoRA network is on correct device if it exists
+        # This is needed because load_model() may move the transformer to CPU on ROCm,
+        # but LoRA modules need to be on the same device as the model
+        if hasattr(self, 'network') and self.network is not None:
+            # Get the device from the model (transformer or unet)
+            model_device = None
+            if hasattr(self.sd, 'model') and self.sd.model is not None:
+                # Check if model has a device attribute or get it from parameters
+                try:
+                    if hasattr(self.sd.model, 'device'):
+                        model_device = self.sd.model.device
+                    else:
+                        # Get device from first parameter
+                        for param in self.sd.model.parameters():
+                            model_device = param.device
+                            break
+                except:
+                    pass
+            
+            # If we couldn't determine model device, use the training device
+            if model_device is None:
+                model_device = self.device_torch
+            
+            # Move LoRA network to match model device
+            if model_device != torch.device('cpu'):
+                print(f"[DEBUG] Moving LoRA network to device {model_device} to match model")
+                self.network.force_to(model_device, dtype=torch.float32)
+        
         # compile the model if needed
         if self.model_config.compile:
             try:
@@ -1761,10 +1798,35 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
+        # For ROCm, ensure transformer is on GPU before creating LoRA modules
+        # LoRA modules need to be on same device as parent modules
+        from toolkit.backend_utils import is_rocm_available
+        if is_rocm_available() and hasattr(unet, 'device'):
+            if unet.device == torch.device('cpu'):
+                try:
+                    from toolkit.backend_utils import synchronize_gpu
+                    synchronize_gpu()
+                    unet.to(self.device_torch, dtype=dtype)
+                    print(f"[DEBUG] Moved unet/transformer to GPU before LoRA creation for ROCm")
+                except (RuntimeError, Exception) as e:
+                    if "HIP" in str(e) or "hipError" in str(e):
+                        print(f"[DEBUG] Could not move unet/transformer to GPU, keeping on CPU: {e}")
+                    else:
+                        raise
+        
         unet.to(self.device_torch, dtype=dtype)
         unet.requires_grad_(False)
         unet.eval()
-        vae = vae.to(torch.device('cpu'), dtype=dtype)
+        # For ROCm, keep VAE on GPU to avoid RAM usage (matching musubi-tuner approach)
+        # Only move to CPU if not on ROCm and not training (to save GPU memory)
+        from toolkit.backend_utils import is_rocm_available
+        if is_rocm_available():
+            # Keep VAE on GPU for ROCm - moving to CPU causes RAM/swap issues
+            vae = vae.to(self.device_torch, dtype=dtype)
+            print("[DEBUG] ROCm: Keeping VAE on GPU to avoid RAM usage")
+        else:
+            # For CUDA, move VAE to CPU to save GPU memory (only if not needed during training)
+            vae = vae.to(torch.device('cpu'), dtype=dtype)
         vae.requires_grad_(False)
         vae.eval()
         if self.train_config.learnable_snr_gos:
@@ -1811,9 +1873,46 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if hasattr(self.sd, 'target_lora_modules'):
                     network_kwargs['target_lin_modules'] = self.sd.target_lora_modules
 
+                # CRITICAL FOR ROCm: Ensure model is on GPU BEFORE creating LoRA modules
+                # LoRA modules inherit device from parent modules at creation time
+                # This matches musubi-tuner's approach: ensure model is on correct device before LoRA creation
+                model_to_train = self.sd.get_model_to_train()
+                from toolkit.backend_utils import is_rocm_available
+                if is_rocm_available():
+                    # Check actual device of model parameters
+                    actual_device = None
+                    try:
+                        for param in model_to_train.parameters():
+                            actual_device = param.device
+                            break
+                    except:
+                        pass
+                    
+                    # If model is on CPU, move it to GPU before creating LoRA
+                    # Update the actual model object, not just a local reference
+                    if actual_device is None or actual_device.type == 'cpu':
+                        try:
+                            from toolkit.backend_utils import synchronize_gpu
+                            synchronize_gpu()
+                            print(f"[DEBUG] Moving model to GPU before LoRA creation (ROCm)")
+                            # Move the actual model object
+                            if hasattr(self.sd, 'unet'):
+                                self.sd.unet = self.sd.unet.to(self.device_torch, dtype=dtype)
+                            if hasattr(self.sd, 'model'):
+                                self.sd.model = self.sd.model.to(self.device_torch, dtype=dtype)
+                            # Also move model_to_train reference
+                            model_to_train = model_to_train.to(self.device_torch, dtype=dtype)
+                            synchronize_gpu()
+                            print(f"[DEBUG] ✓ Model moved to GPU successfully")
+                        except (RuntimeError, Exception) as e:
+                            if "HIP" in str(e) or "hipError" in str(e):
+                                print(f"[DEBUG] ⚠ Could not move model to GPU, keeping on CPU: {str(e)[:80]}")
+                            else:
+                                raise
+
                 self.network = NetworkClass(
                     text_encoder=text_encoder,
-                    unet=self.sd.get_model_to_train(),
+                    unet=model_to_train,
                     lora_dim=self.network_config.linear,
                     multiplier=1.0,
                     alpha=self.network_config.linear_alpha,
@@ -1843,9 +1942,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     **network_kwargs
                 )
 
-
+                # Ensure LoRA network is on the same device and dtype as model (matching musubi-tuner approach)
+                # Get dtype from model
+                model_dtype = dtype
+                try:
+                    for param in model_to_train.parameters():
+                        model_dtype = param.dtype
+                        break
+                except:
+                    pass
+                
                 # todo switch everything to proper mixed precision like this
-                self.network.force_to(self.device_torch, dtype=torch.float32)
+                self.network.force_to(self.device_torch, dtype=model_dtype)
                 # give network to sd so it can use it
                 self.sd.network = self.network
                 self.network._update_torch_multiplier()
@@ -2355,7 +2463,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.sample(self.step_num)
                         if self.train_config.unload_text_encoder:
                             # make sure the text encoder is unloaded
-                            self.sd.text_encoder_to('cpu')
+                            # For ROCm, don't move to CPU - it should already be unloaded (replaced with FakeTextEncoder)
+                            # Moving to CPU causes RAM usage
+                            from toolkit.backend_utils import is_rocm_available
+                            if not is_rocm_available():
+                                self.sd.text_encoder_to('cpu')
                         flush()
 
                         self.ensure_params_requires_grad()

@@ -246,8 +246,12 @@ class SDTrainer(BaseSDTrainProcess):
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         if self.is_caching_text_embeddings:
-            # make sure model is on cpu for this part so we don't oom.
-            self.sd.unet.to('cpu')
+            # For ROCm, keep UNet on GPU to avoid RAM usage (matching musubi-tuner approach)
+            # Moving to CPU causes RAM/swap issues on ROCm
+            from toolkit.backend_utils import is_rocm_available
+            if not is_rocm_available():
+                # make sure model is on cpu for this part so we don't oom (CUDA only)
+                self.sd.unet.to('cpu')
         
         # cache unconditional embeds (blank prompt)
         with torch.no_grad():
@@ -297,7 +301,15 @@ class SDTrainer(BaseSDTrainProcess):
                 self.sd.vae.to(self.device_torch)
         else:
             # offload it. Already cached
-            self.sd.vae.to('cpu')
+            # For ROCm, keep VAE on GPU to avoid RAM/swap issues (matching musubi-tuner approach)
+            from toolkit.backend_utils import is_rocm_available
+            if is_rocm_available():
+                # Keep VAE on GPU even if cached - moving to CPU causes RAM/swap issues
+                print("[DEBUG] ROCm: Keeping VAE on GPU even with cached latents to avoid RAM usage")
+                self.sd.vae.to(self.device_torch)
+            else:
+                # For CUDA, move to CPU to save GPU memory
+                self.sd.vae.to('cpu')
             flush()
         add_all_snr_to_noise_scheduler(self.sd.noise_scheduler, self.device_torch)
         if self.adapter is not None:

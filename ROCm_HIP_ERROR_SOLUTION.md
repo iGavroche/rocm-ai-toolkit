@@ -1,71 +1,80 @@
-# ROCm HIP Error Solution
+# ROCm GPU Placement Solution (Matching musubi-tuner)
 
 ## Problem
-The toolkit was encountering `HIP error: invalid argument` during Accelerate's `prepare()` calls, specifically when Accelerate attempted to move models to the GPU device.
+The toolkit was moving models to CPU before `prepare_accelerator()` and keeping them there for ROCm, causing CPU/RAM usage and swapping. This was inefficient and didn't match the musubi-tuner approach.
 
 ## Root Cause
-Even when passing `device_placement=[False]` to `accelerator.prepare()`, Accelerate's internal `prepare_model()` method still calls `model.to(self.device)` in certain cases. This happens because:
+The previous implementation:
+1. Moved models to CPU before `prepare_accelerator()` 
+2. Used `device_placement=False` to prevent Accelerate from placing models on GPU
+3. Kept models on CPU after prepare, causing CPU/RAM usage and swapping
 
-1. Accelerate's `prepare_model()` checks `device_placement and not self.verify_device_map(model)` and then calls `model.to(self.device)`
-2. The `device_placement` parameter in `prepare_model()` defaults to `self.device_placement` (the Accelerator's default), not the list passed to `prepare()`
-3. On ROCm, direct `model.to(device)` calls can trigger HIP errors due to compatibility issues
-
-## Solution Implemented
+## Solution Implemented (Matching musubi-tuner)
 
 ### 1. Accelerator Configuration (`toolkit/accelerator.py`)
-- **Create Accelerator with `device_placement=False` for ROCm**: When ROCm is detected, we create the Accelerator instance with `device_placement=False` to prevent automatic device transfers.
-- **Monkey Patch `prepare_model()`**: We patch Accelerate's `prepare_model()` method to force `device_placement=False` for all ROCm calls, ensuring no automatic device transfers occur.
+- **Create Accelerator with `device_placement=True` for ROCm**: When ROCm is detected, we create the Accelerator instance with `device_placement=True` (default) to allow GPU placement.
+- **Monkey Patch `prepare_model()`**: We patch Accelerate's `prepare_model()` method to allow device placement (defaults to True) with error handling for HIP errors.
 
 ### 2. Safe Prepare Wrapper (`toolkit/accelerator.py`)
-- **Enhanced Error Handling**: The `safe_prepare()` function catches any RuntimeError (including AcceleratorError and HIP errors) during `prepare()` calls.
-- **CPU-Only Model Placement**: For ROCm, models are kept on CPU and we don't attempt to move them to the device after `prepare()`. Models will be moved to device during forward passes when needed.
+- **Allow GPU Placement**: The `safe_prepare()` function uses `device_placement=[True]` for ROCm to allow Accelerate to place models on GPU.
+- **No CPU Forcing**: Models are NOT moved to CPU before prepare - they should already be on GPU from model loading.
+- **Error Handling**: HIP errors during prepare are caught and logged, but models stay on GPU.
 
 ### 3. Model Loading Strategy
-- **Keep Models on CPU**: During model loading, we explicitly keep models on CPU for ROCm and let Accelerate handle placement (or keep them on CPU if device transfer fails).
-- **Step-by-Step Transfers**: When device transfers are necessary, we use step-by-step transfers (CPU → device → dtype) with error handling.
+- **Load Models to GPU**: During model loading (in `wan21.py`, `wan22_14b_model.py`), models are loaded directly to `accelerator.device` (GPU).
+- **Keep Models on GPU**: Models remain on GPU throughout the training process, matching musubi-tuner's approach.
+- **Explicit Device Placement**: After `prepare_accelerator()`, models are explicitly moved to `accelerator.device` to ensure they're on GPU.
 
 ## Changes Made
 
 ### `toolkit/accelerator.py`
-1. Modified `get_accelerator()` to create Accelerator with `device_placement=False` for ROCm
-2. Added `_patch_accelerate_for_rocm()` to monkey patch `prepare_model()` 
-3. Simplified `safe_prepare()` to return models as-is for ROCm (no manual device transfer)
+1. Modified `get_accelerator()` to create Accelerator with `device_placement=True` for ROCm (matching musubi-tuner)
+2. Updated `_patch_accelerate_for_rocm()` to allow device placement (defaults to True) with error handling
+3. Modified `safe_prepare()` to use `device_placement=[True]` and NOT move models to CPU
 
-### `start_toolkit.sh`
-1. Added `--dev` flag for UI development mode with hot reload
-2. Updated help text to show the new flag
+### `jobs/process/BaseSDTrainProcess.py`
+1. Removed all CPU movement before `prepare_accelerator()`
+2. Changed `safe_prepare()` calls to use `device_placement=[True]`
+3. Added explicit device placement after prepare to ensure models are on `accelerator.device`
 
-## How It Works
+## How It Works (Matching musubi-tuner)
 
 1. **Accelerator Initialization**: 
-   - On ROCm: `Accelerator(device_placement=False)` + monkey patch
+   - On ROCm: `Accelerator(device_placement=True)` + monkey patch (allows GPU placement)
    - On CUDA: Normal `Accelerator()`
 
-2. **Model Preparation**:
-   - Models are moved to CPU before `safe_prepare()` is called
-   - `safe_prepare()` calls `accelerator.prepare()` with `device_placement=[False]`
-   - The monkey-patched `prepare_model()` ensures no device transfer occurs
-   - Models remain on CPU after preparation
+2. **Model Loading**:
+   - Models are loaded directly to `accelerator.device` (GPU) during model loading
+   - This happens in `wan21.py` and `wan22_14b_model.py` - models are moved to GPU after loading
 
-3. **Training**:
-   - During forward passes, models will be moved to device as needed
-   - If device transfer fails, operations can fall back to CPU
+3. **Model Preparation**:
+   - Models are already on GPU from loading (NOT moved to CPU)
+   - `safe_prepare()` calls `accelerator.prepare()` with `device_placement=[True]`
+   - The monkey-patched `prepare_model()` allows device placement (defaults to True)
+   - Models remain on GPU after preparation
+   - Explicit `.to(accelerator.device)` calls ensure models are on GPU
+
+4. **Training**:
+   - Models stay on GPU throughout training
+   - No CPU/RAM usage or swapping
+   - LoRA modules remain on same device as parent modules
 
 ## Testing
-To test if this resolves the HIP errors:
+To test if this works correctly:
 1. Run a training job with ROCm
-2. Verify that models are prepared without HIP errors
-3. Check that training proceeds normally (models may remain on CPU or be moved during forward passes)
+2. Verify that models stay on GPU (check `rocm-smi` or `nvidia-smi`)
+3. Check that there's no CPU/RAM spiking or swapping
+4. Verify training proceeds normally without HIP errors
+5. Confirm LoRA modules are on the same device as parent modules
 
-## Alternative Approaches Considered
-1. **Model Wrappers**: Wrapping models to intercept `.to()` calls - too invasive
-2. **CPU Offload**: Using Accelerate's CPU offload feature - requires different configuration
-3. **Direct Patching**: Patching at the Accelerate library level - monkey patch approach chosen as more maintainable
+## Key Differences from Previous Approach
+- **Previous**: Models moved to CPU → kept on CPU → caused RAM/swap usage
+- **Current**: Models loaded to GPU → kept on GPU → no RAM/swap usage (matching musubi-tuner)
 
 ## Notes
-- Models being on CPU may impact performance, but it's better than crashing
-- Future improvements could include:
-  - Gradual device transfer during training
+- This matches musubi-tuner's approach exactly: load to `accelerator.device` and keep there
+- Models being on GPU is more efficient and prevents CPU/RAM issues
+- HIP errors are handled gracefully but don't force CPU fallback
   - Better error recovery for device transfers
   - ROCm-specific optimizations as they become available
 

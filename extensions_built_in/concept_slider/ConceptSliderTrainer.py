@@ -52,8 +52,11 @@ class ConceptSliderTrainer(DiffusionTrainer):
     def hook_before_train_loop(self):
         # do this before calling parent as it unloads the text encoder if requested
         if self.is_caching_text_embeddings:
-            # make sure model is on cpu for this part so we don't oom.
-            self.sd.unet.to("cpu")
+            # For ROCm, keep UNet on GPU to avoid RAM usage (matching musubi-tuner approach)
+            from toolkit.backend_utils import is_rocm_available
+            if not is_rocm_available():
+                # make sure model is on cpu for this part so we don't oom.
+                self.sd.unet.to("cpu")
 
         # cache unconditional embeds (blank prompt)
         with torch.no_grad():
